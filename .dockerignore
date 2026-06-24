@@ -1,0 +1,11 @@
+.git
+node_modules
+dist
+dist-ssr
+.env
+.env.*
+*.local
+*.log
+*.tsbuildinfo
+*.mp4
+.DS_Store

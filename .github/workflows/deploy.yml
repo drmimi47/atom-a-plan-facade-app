@@ -1,0 +1,35 @@
+name: deploy
+
+on:
+  push:
+    branches: [prod]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, hdr-vm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write .env from secrets
+        run: |
+          umask 177
+          cat > .env <<EOF
+          VITE_FIREBASE_API_KEY=${{ secrets.VITE_FIREBASE_API_KEY }}
+          VITE_FIREBASE_AUTH_DOMAIN=${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
+          VITE_FIREBASE_PROJECT_ID=${{ secrets.VITE_FIREBASE_PROJECT_ID }}
+          VITE_FIREBASE_STORAGE_BUCKET=${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}
+          VITE_FIREBASE_MESSAGING_SENDER_ID=${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}
+          VITE_FIREBASE_APP_ID=${{ secrets.VITE_FIREBASE_APP_ID }}
+          ALLOWED_HOSTS=${{ vars.ALLOWED_HOSTS }}
+          EOF
+
+      - name: Build & (re)start container
+        run: docker compose up -d --build --force-recreate
+
+      - name: Prune dangling images
+        run: docker image prune -f

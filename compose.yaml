@@ -1,0 +1,12 @@
+services:
+  one-button-drawing:
+    build: .
+    restart: unless-stopped
+    # VITE_FIREBASE_* (public by design) + ALLOWED_HOSTS, created by the deploy workflow.
+    # The billable VITE_ANTHROPIC_API_KEY / VITE_GEMINI_API_KEY are intentionally NOT set
+    # here: they would be extractable from the public bundle (see SETUP.md). The app
+    # degrades gracefully without them.
+    env_file: .env
+    # Bound to localhost only — the VM's existing nginx proxies to this port.
+    ports:
+      - "127.0.0.1:5174:5174"
