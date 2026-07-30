@@ -18,7 +18,7 @@ import {
 } from '../canvas/snapping';
 import type { Constraints } from '../../backend/types';
 import { clampDragToConstraints } from '../../backend/clamp';
-import { screenToWorld } from '../canvas/coords';
+import { screenToWorld, worldToScreen } from '../canvas/coords';
 import {
   resizeShape,
   resizeWall,
@@ -38,6 +38,7 @@ import {
   hitCenterLabel,
   hitCenterLock,
   hitEdgePlus,
+  polygonShape,
   hitPredictionOption,
   adjacentCopyOffset,
   adjacentRoomPlacement,
@@ -79,6 +80,7 @@ import {
   hitBoundaryEdge as hitPartitionBoundaryEdge,
   hitBorderCorner as hitPartitionCorner,
   moveBorderCorner as movePartitionCorner,
+  rotateBorder as rotatePartitionBorder,
   borderIndexAt as partitionBorderIndexAt,
   borderBooleanHoverAt,
   uniteBorders as unitePartitionBorders,
@@ -96,14 +98,23 @@ import {
   moveSegmentExtra as movePartitionSegmentExtra,
   moveLatticePreservingFrames as partitionPreserveFrames,
   cellGroupAt as partitionCellGroupAt,
+  groupCellKeys as partitionGroupCellKeys,
+  cellKeyAt as partitionCellKeyAt,
+  isSubdivided as partitionIsSubdivided,
+  borderMode as partitionBorderMode,
   pointInBorder as partitionPointInBorder,
-  groupKeysInRect as partitionGroupKeysInRect,
-  groupFrame as partitionGroupFrame,
+  cellKeysInRect as partitionCellKeysInRect,
+  cellRectsOf as partitionCellRectsOf,
+  cellGroups as partitionCellGroups,
+  cellKey as partitionCellKey,
+  duplicateBorder as partitionDuplicateBorder,
+  panelFrameAt as partitionPanelFrame,
   frameInnerRect as partitionFrameInnerRect,
-  setGroupFrame as partitionSetGroupFrame,
+  setPanelFrame as partitionSetPanelFrame,
   type BorderBooleanHover,
-  type BoundaryEdge,
+  type FacadeLayer,
   type CellRef,
+  type PanelMode,
   type ExtraSegHandle,
   type FacadeDoc,
   type LineHandle,
@@ -111,9 +122,55 @@ import {
   type SegmentRef,
 } from '../facade/partition';
 
-/** Screen cursor for a boundary edge (n/s = vertical resize, e/w = horizontal). */
-function cursorForBoundaryEdge(edge: BoundaryEdge): string {
-  return edge === 'n' || edge === 's' ? 'ns-resize' : 'ew-resize';
+/** Radius (screen px) of a border corner's rotation zone, and how far out along the bisector it sits. */
+const BORDER_ROTATE_RADIUS = 11;
+
+/**
+ * Is the screen point inside a border corner's ROTATION zone — the ring just outside the corner, centred
+ * on its exterior bisector where {@link drawCornerRotationArcs} paints the arc? Mirrors the arc's geometry
+ * so the grab area matches what's drawn, and sits clear of the corner grip itself (which deforms).
+ */
+function hitBorderRotateZone(
+  poly: { x: number; y: number }[],
+  screenX: number,
+  screenY: number,
+  camera: Camera,
+): boolean {
+  const n = poly.length;
+  if (n < 3) return false;
+  const off = BORDER_DIM_GAP / 2; // the arc's radius
+  for (let i = 0; i < n; i++) {
+    const c = worldToScreen(poly[i].x, poly[i].y, camera);
+    const prev = worldToScreen(poly[(i + n - 1) % n].x, poly[(i + n - 1) % n].y, camera);
+    const next = worldToScreen(poly[(i + 1) % n].x, poly[(i + 1) % n].y, camera);
+    let d1x = prev.x - c.x;
+    let d1y = prev.y - c.y;
+    let d2x = next.x - c.x;
+    let d2y = next.y - c.y;
+    const l1 = Math.hypot(d1x, d1y) || 1;
+    const l2 = Math.hypot(d2x, d2y) || 1;
+    d1x /= l1;
+    d1y /= l1;
+    d2x /= l2;
+    d2y /= l2;
+    const bx = -(d1x + d2x); // exterior bisector, away from the interior
+    const by = -(d1y + d2y);
+    const bl = Math.hypot(bx, by);
+    if (bl < 1e-3) continue; // near-straight corner draws no arc, so nothing to grab
+    const zx = c.x + (bx / bl) * off;
+    const zy = c.y + (by / bl) * off;
+    if ((screenX - zx) ** 2 + (screenY - zy) ** 2 <= BORDER_ROTATE_RADIUS ** 2) return true;
+  }
+  return false;
+}
+
+/**
+ * Screen cursor for a boundary edge. Derived from the edge's own direction rather than a compass face, so
+ * it stays correct on the angled edges a boolean union/difference leaves behind: a mostly-horizontal edge
+ * stretches vertically, and vice versa.
+ */
+function cursorForBoundaryEdge(a: { x: number; y: number }, b: { x: number; y: number }): string {
+  return Math.abs(b.x - a.x) >= Math.abs(b.y - a.y) ? 'ns-resize' : 'ew-resize';
 }
 
 /**
@@ -124,25 +181,6 @@ function cursorForBoundaryEdge(edge: BoundaryEdge): string {
  */
 function cursorForNormal(nx: number, ny: number): string {
   return Math.abs(nx) >= Math.abs(ny) ? 'col-resize' : 'row-resize';
-}
-
-/**
- * Wrap a facade border quad's corners as a zero-wall `Square` so it can feed the room snapper / edge-stretch
- * (which both operate on `Square`). With zero walls inner == outer == centre, so the snapper's equal-thickness
- * centreline match fires — i.e. border edge snaps to border edge.
- */
-function borderToSquare(corners: { x: number; y: number }[]): Square {
-  return {
-    id: 'facade-border',
-    x: 0,
-    y: 0,
-    width: 0,
-    height: 0,
-    rotation: 0,
-    walls: { n: 0, e: 0, s: 0, w: 0 },
-    dots: false,
-    corners: corners.map((p) => ({ x: p.x, y: p.y })),
-  };
 }
 
 /**
@@ -271,21 +309,33 @@ interface InteractionParams {
   facadeRef?: MutableRefObject<boolean | undefined>;
   /**
    * Facade Layers tool (uniform sticky-cell partition). When `layersActiveRef` is true the pointer edits
-   * the partition document instead of rooms: drag a rectangle to draw the active layer's boundary, stretch
-   * boundary edges / cell cuts, right-click a cell to split it; empty space pans. Rooms are bypassed.
+   * the partition document instead of rooms. There is ONE editing mode, split by depth rather than by a
+   * toggle: at shape level a border is selected, dragged, and reshaped by its handles; double-clicking
+   * steps inside it, where the pointer edits mullions and paint-selects panels. Empty space outside every
+   * border rubber-band selects panels. Rooms are bypassed.
    */
   layersActiveRef?: MutableRefObject<boolean | undefined>;
   /**
-   * Border vs Panels sub-mode of the Layers tool. In BORDER mode the trim boundary is editable — drag to
-   * draw it, move corners, stretch edges. In PANELS mode the border is LOCKED (no draw/corner/edge) and the
-   * pointer edits the inner grid (lines, segments, cell splits, panel-group select). Defaults to Border.
+   * Index of the border the user has DOUBLE-CLICKED into, or null. This is the shape-vs-contents split that
+   * replaced the Border/Panels switch:
+   *
+   *  - Outside it, a border is a SHAPE — click to select it, drag to move it, drag a handle to reshape it.
+   *  - Inside it, the pointer edits that border's CONTENTS — mullions, cell splits, and paint-selecting
+   *    panels — and the floating panel bar is open.
+   *
+   * Only one border is ever entered. A click outside it, or Escape, steps back out.
    */
-  borderModeRef?: MutableRefObject<boolean | undefined>;
+  partitionEnteredRef?: MutableRefObject<number | null>;
   /**
-   * Frame sub-mode of the Layers tool. When true the offset mullion frame is shown and editing is LOCKED —
-   * border, panel grid, and cell-split are all disabled, the pointer only pans. Mutually exclusive with the
-   * Border/Panels sub-modes.
+   * Live edge-plus duplicate preview for the renderer: the border being copied, the per-copy step, and how
+   * many copies the drag currently spans. Null when no plus drag is in flight.
    */
+  partitionPlusRef?: MutableRefObject<{
+    border: number;
+    dx: number;
+    dy: number;
+    count: number;
+  } | null>;
   /**
    * Edit-a-panel session. When set, the pointer edits the per-edge frame of the selected group(s): hovering a
    * representative-panel edge highlights it, dragging it sets that side's frame width (mirrored to every key),
@@ -294,19 +344,31 @@ interface InteractionParams {
   frameEditRef?: MutableRefObject<{
     keys: string[];
     rect: Rect;
-    priorCamera: { x: number; y: number; scale: number };
     hoverSide: 'n' | 'e' | 's' | 'w' | 'b' | null;
     allSides: boolean;
   } | null>;
   partitionDocRef?: MutableRefObject<FacadeDoc>;
   /** The shift-selected inner line segment (highlighted, jog-draggable), or null. */
   partitionSelSegRef?: MutableRefObject<SegmentRef | null>;
-  /** Selected panel GROUP keys (clicking a panel selects its whole material group). */
-  partitionGroupSelRef?: MutableRefObject<Set<string>>;
+  /** Selected panels as per-CELL keys: a click expands the clicked panel's whole material group into the
+   *  set, a rubber-band sweep adds only the panels it covered. */
+  partitionCellSelRef?: MutableRefObject<Set<string>>;
   /** Border indices picked (shift-click, Border mode) for a boolean unite/difference op, in selection order. */
   partitionBorderSelRef?: MutableRefObject<Set<number>>;
   /** Right-click a cell → open the split + Edit/Assign menu at that screen point for that cell. */
-  onCellContextMenu?: (info: { screenX: number; screenY: number; ref: CellRef; rect: Rect | null }) => void;
+  /**
+   * Open (or close, with null) the floating panel menu. Reports the cell REF, not a screen point — the
+   * owner recomputes the position from `onCellMenuAnchor` so the menu tracks the panel as it moves.
+   */
+  onCellMenu?: (
+    info: {
+      ref: CellRef;
+      rect: Rect | null;
+      subdivided: boolean;
+      /** The shape's rationalization mode, so the Optimize menu can tick the live one. */
+      mode: PanelMode | null;
+    } | null,
+  ) => void;
   /** Exit the active Edit-a-panel session (a clean click outside the border / on another group acts as Done). */
   onExitFrameEdit?: () => void;
 }
@@ -330,7 +392,10 @@ type Mode =
   | 'segmentDrag'
   | 'segExtraDrag'
   | 'partitionFrame'
-  | 'partitionMarquee';
+  | 'partitionMarquee'
+  | 'partitionPaint'
+  | 'partitionPlus'
+  | 'partitionRotate';
 
 /** Most copies a single edge-plus drag can spawn (matches the prompt cap). */
 const MAX_PLUS_COPIES = 50;
@@ -340,6 +405,23 @@ const MIN_FOOTPRINT_WORLD = WORLD_UNITS_PER_FOOT;
 
 /** Target scale the dragged selection shrinks to while it hovers the Library button. */
 const LIBRARY_SHRINK_MIN = 0.14;
+
+/**
+ * True when a key event's target already owns the keyboard: a text field, or any
+ * focusable control Space would activate. Canvas shortcuts stand down for these.
+ */
+function isKeyboardTarget(target: EventTarget | null): boolean {
+  const t = target as HTMLElement | null;
+  if (!t || !t.tagName) return false;
+  return (
+    t.isContentEditable ||
+    t.tagName === 'INPUT' ||
+    t.tagName === 'TEXTAREA' ||
+    t.tagName === 'SELECT' ||
+    t.tagName === 'BUTTON' ||
+    t.tagName === 'A'
+  );
+}
 
 /** Fresh shape id, mirroring InfiniteCanvas's generator. */
 function createId(): string {
@@ -356,12 +438,12 @@ interface DragItem {
 
 /**
  * Single pointer controller for the canvas. On pointer-down it arbitrates, in
- * priority order: (0) commit an armed placement, (1) shift → rubber-band
- * marquee, (2) the rotation knob of a single selection → rotate, (3) an
- * edge/corner of the selection → stretch the whole selection, (4) a square body
- * → select + move the whole selection, (5) empty space → deselect + pan. All
- * state lives in closure variables and refs — no React state — so dragging
- * never triggers a re-render.
+ * priority order: (0!) Space held → pan (the only camera gesture), (0) commit an
+ * armed placement, (1) shift → additive rubber-band marquee, (2) the rotation knob
+ * of a single selection → rotate, (3) an edge/corner of the selection → stretch the
+ * whole selection, (4) a square body → select + move the whole selection, (5) empty
+ * space → deselect + rubber-band marquee. All state lives in closure variables and
+ * refs — no React state — so dragging never triggers a re-render.
  */
 export function useCanvasInteractions({
   canvasRef,
@@ -402,13 +484,14 @@ export function useCanvasInteractions({
   alignGuidesRef,
   facadeRef,
   layersActiveRef,
-  borderModeRef,
+  partitionEnteredRef,
+  partitionPlusRef,
   frameEditRef,
   partitionDocRef,
   partitionSelSegRef,
-  partitionGroupSelRef,
+  partitionCellSelRef,
   partitionBorderSelRef,
-  onCellContextMenu,
+  onCellMenu,
   onExitFrameEdit,
 }: InteractionParams): void {
   useEffect(() => {
@@ -416,6 +499,8 @@ export function useCanvasInteractions({
     if (!el) return;
 
     let mode: Mode = 'none';
+    // Space-drag is the ONLY pan gesture — a bare pointer drag always selects or edits.
+    let spaceHeld = false;
     let lastClientX = 0;
     let lastClientY = 0;
     let dragStartX = 0; // world-space anchor for move/resize
@@ -446,7 +531,8 @@ export function useCanvasInteractions({
     // against the FREE delta from grab — matching how room moves snap — then apply incrementally.
     let partitionMoveOrig: { x: number; y: number }[] | null = null;
     let partitionMoveStart = { x: 0, y: 0 };
-    let partitionEdge: BoundaryEdge | null = null;
+    // Index of the grabbed border edge (poly[i] → poly[i+1]); null when no edge drag is in flight.
+    let partitionEdge: number | null = null;
     let partitionEdgeBorder = 0; // which border (index) the grabbed edge belongs to
     // Snapshot of the border quad + cursor at the start of a boundary-edge stretch (reuses the room's
     // delta-based `stretchEdge`, so an angled edge stretches exactly like a default shape's edge).
@@ -457,6 +543,32 @@ export function useCanvasInteractions({
     let partitionSegExtra: ExtraSegHandle | null = null;
     // A clean click on a cell (no line/edge/corner hit) selects it on release; captured here.
     let partitionCellCandidate: { x: number; y: number; shift: boolean } | null = null;
+    // Paint-select: the selection as it stood when the stroke began. A plain drag paints onto an empty
+    // base (so the stroke REPLACES), Shift paints onto the existing one (so it ADDS). Keeping the base
+    // separate is what lets every pointer-move recompute the result rather than accumulate irreversibly.
+    let paintBase: Set<string> | null = null;
+    // In-flight edge-plus duplicate on a border: which shape and side, the per-copy step, the world point
+    // the press started at, and how many copies the drag has reached so far.
+    // In-flight border rotation: which shape, its outline at grab time, and the pointer angle + snapped
+    // rotation the gesture started from — so each frame applies an ABSOLUTE angle to the original.
+    let partitionRotate: {
+      border: number;
+      orig: { x: number; y: number }[];
+      startAngle: number;
+    } | null = null;
+    let partitionPlus: {
+      border: number;
+      dir: number;
+      stepX: number;
+      stepY: number;
+      startX: number;
+      startY: number;
+      count: number;
+    } | null = null;
+    // Cells the stroke itself has touched, and the last world point sampled — the stroke is walked as a
+    // SEGMENT between pointer-moves, not sampled at them, so a fast drag can't skip over a panel.
+    let painted = new Set<string>();
+    let paintLast: { x: number; y: number } | null = null;
     // Edit-a-panel frame drag: the grabbed side, the snapshot transient Square at grab, the world press
     // point, and whether Shift (all sides at once) was held.
     let frameEditSide: 'n' | 'e' | 's' | 'w' | 'b' | null = null;
@@ -479,13 +591,28 @@ export function useCanvasInteractions({
     // The transient Square for the Edit-a-panel session: interior = the inset glass rect, walls = the group's
     // per-edge frame widths, so its outer footprint is exactly the representative cell rect. This lets the
     // standard-shape edge code (hitShapeEdge / resizeWall) drive per-edge frame editing. Null when no session.
-    const frameEditSquare = (): Square | null => {
+    /** Every panel in the Edit selection, as world rects — each one is a grabbable set of mullions. */
+    const frameEditRects = (): Rect[] => {
+      const fe = frameEditRef?.current;
+      const doc = partitionDocRef?.current;
+      if (!fe || !doc) return [];
+      const rects = partitionCellRectsOf(partitionActiveLayer(doc), new Set(fe.keys));
+      // The representative first, so a cursor over two overlapping candidates resolves to the one the
+      // session was opened on.
+      return rects.length ? rects : [fe.rect];
+    };
+
+    /**
+     * A selected panel's frame as a zero-rotation `Square` (inner glass + per-side wall = the mullion),
+     * so the shared room edge hit-test can pick its faces.
+     */
+    const frameEditSquareOf = (rect: Rect): Square | null => {
       const fe = frameEditRef?.current;
       const doc = partitionDocRef?.current;
       if (!fe || !doc) return null;
-      const f = partitionGroupFrame(partitionActiveLayer(doc), fe.keys[0]);
+      const f = partitionPanelFrame(partitionActiveLayer(doc), fe.keys[0]);
       if (!f) return null;
-      const inner = partitionFrameInnerRect(fe.rect, f);
+      const inner = partitionFrameInnerRect(rect, f);
       return {
         id: 'frame-edit',
         x: inner.x,
@@ -496,6 +623,26 @@ export function useCanvasInteractions({
         walls: { n: f.n, e: f.e, s: f.s, w: f.w },
         dots: false,
       };
+    };
+
+    /**
+     * Which selected panel's mullion face is under the cursor, if any. Every panel in the selection is
+     * tested, not just the one the session opened on — the drag writes the new width to ALL of them, so
+     * any of them is a legitimate place to grab it. Restricting the grab to one made the others look
+     * inert even though they were changing.
+     */
+    const frameEditFaceAt = (
+      sx2: number,
+      sy2: number,
+      cam2: Camera,
+    ): { sq: Square; side: 'n' | 'e' | 's' | 'w' } | null => {
+      for (const rect of frameEditRects()) {
+        const sq = frameEditSquareOf(rect);
+        if (!sq) continue;
+        const hit = hitShapeEdge(sx2, sy2, sq, cam2);
+        if (hit === 'n' || hit === 'e' || hit === 's' || hit === 'w') return { sq, side: hit };
+      }
+      return null;
     };
 
     // Distance from a world point to a world segment (for grabbing the diagonal border-cut frame edge).
@@ -518,12 +665,17 @@ export function useCanvasInteractions({
       const fe = frameEditRef?.current;
       const doc = partitionDocRef?.current;
       if (!fe || !doc) return null;
-      const edges = partitionPanelBorderEdges(partitionActiveLayer(doc), fe.rect);
+      const layer2 = partitionActiveLayer(doc);
       let best: { a: { x: number; y: number }; b: { x: number; y: number }; nx: number; ny: number; dist: number } | null =
         null;
-      const cx = fe.rect.x + fe.rect.w / 2;
-      const cy = fe.rect.y + fe.rect.h / 2;
-      for (const [a, b] of edges) {
+      // Any selected panel that the trim slices offers its cut edge as a handle, not just the first.
+      const edges: { seg: [{ x: number; y: number }, { x: number; y: number }]; cx: number; cy: number }[] = [];
+      for (const rect of frameEditRects()) {
+        for (const seg of partitionPanelBorderEdges(layer2, rect)) {
+          edges.push({ seg, cx: rect.x + rect.w / 2, cy: rect.y + rect.h / 2 });
+        }
+      }
+      for (const { seg: [a, b], cx, cy } of edges) {
         const dist = distPointSeg(px, py, a.x, a.y, b.x, b.y);
         if (best && dist >= best.dist) continue;
         let nx = b.y - a.y;
@@ -545,7 +697,7 @@ export function useCanvasInteractions({
       const doc = partitionDocRef?.current;
       const fe = frameEditRef?.current;
       if (!doc || !fe) return 0;
-      const f = partitionGroupFrame(partitionActiveLayer(doc), fe.keys[0]);
+      const f = partitionPanelFrame(partitionActiveLayer(doc), fe.keys[0]);
       return f ? f.b ?? (f.n + f.e + f.s + f.w) / 4 : 0;
     };
 
@@ -560,6 +712,20 @@ export function useCanvasInteractions({
     // that ends a stretch — so finishing a drag never makes them flash.
     let pressClientX = 0;
     let pressClientY = 0;
+    /**
+     * Capture the pointer for a drag, tolerating failure. A pointerId that is not an ACTIVE pointer — a
+     * synthesized event, or one the browser has already released — makes `setPointerCapture` throw, which
+     * would abort the gesture handler halfway through and leave the interaction in a half-armed state.
+     * Releasing is already guarded the same way throughout.
+     */
+    const capturePointer = (id: number) => {
+      try {
+        el.setPointerCapture(id);
+      } catch {
+        // not an active pointer; the gesture still works, it just isn't captured.
+      }
+    };
+
     let draggedSinceDown = false;
     let edgeClickArmed = false;
     let gestureDuplicated = false; // an Alt-drag copy was made this gesture
@@ -702,6 +868,85 @@ export function useCanvasInteractions({
       selectionRef.current = new Set(copies.map((c) => c.id));
     };
 
+    /**
+     * Open the floating panel menu for the cell at `world`. Reports the cell REF rather than a fixed screen
+     * point — the menu's position is recomputed every scene draw from the live selection, so it rides along
+     * as the panels are dragged, panned, or zoomed. A world point that hits no cell closes the menu. The ref
+     * is what Split and Edit act on; the bar's placement and dimensions come from the whole selection.
+     */
+    const openCellMenu = (layer: FacadeLayer, world: { x: number; y: number }) => {
+      const ref = hitPartitionCell(layer, world);
+      if (!ref) {
+        onCellMenu?.(null);
+        return;
+      }
+      // `subdivided` gates the panel actions in the bar: before the first split a border is one bare
+      // pseudo-panel — the raw elevation — so there is nothing to frame or assign a material to yet.
+      onCellMenu?.({
+        ref,
+        rect: partitionCellRefRect(layer, ref),
+        subdivided: partitionIsSubdivided(layer, ref.border),
+        mode: partitionBorderMode(layer, ref.border),
+      });
+    };
+
+    /**
+     * Extend the paint stroke from `paintLast` to `to`, adding every panel the segment crosses. Sampling the
+     * whole segment (rather than just the pointer-move positions) is what makes the brush feel solid: at a
+     * fast drag, or a low frame rate, consecutive moves can be several panels apart.
+     */
+    const paintTo = (layer: FacadeLayer, to: { x: number; y: number }) => {
+      const from = paintLast ?? to;
+      const dx = to.x - from.x;
+      const dy = to.y - from.y;
+      // One sample per ~4 screen px, so the cost tracks how far the cursor moved on screen, not in world
+      // units — a zoomed-out flick and a zoomed-in nudge do comparable work. Capped for a pathological jump.
+      const stepWorld = 4 / cameraRef.current.scale;
+      const steps = Math.min(512, Math.max(1, Math.ceil(Math.hypot(dx, dy) / stepWorld)));
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const k = partitionCellKeyAt(layer, { x: from.x + dx * t, y: from.y + dy * t });
+        if (k) painted.add(k);
+      }
+      paintLast = { x: to.x, y: to.y };
+      // The live result is always base ∪ stroke, recomputed rather than accumulated, so the Shift/plain
+      // distinction stays exact for the whole gesture.
+      if (partitionCellSelRef) {
+        partitionCellSelRef.current = new Set([...(paintBase ?? []), ...painted]);
+      }
+    };
+
+    /**
+     * Re-point the menu at the current cell selection. Used by the gestures that select without a click on a
+     * specific panel (the rubber-band sweep): the first selected panel becomes the Split/Edit target, and an
+     * empty selection closes the bar.
+     */
+    const syncCellMenuToSelection = (layer: FacadeLayer, cells: Set<string>) => {
+      if (!cells.size) {
+        onCellMenu?.(null);
+        return;
+      }
+      // Anchor on a panel's CLIPPED CENTROID, never its rect centre. A panel the border slices keeps its
+      // full rect, and on a diagonal that rect's centre often lies OUTSIDE the boundary — `hitCell` finds
+      // nothing there and the bar closes even though panels are plainly selected. The centroid of the
+      // visible (clipped) shape is always inside it. Every selected panel is tried, so one awkward shape
+      // can't sink the whole gesture.
+      for (const g of partitionCellGroups(layer)) {
+        if (!cells.has(partitionCellKey(g.rect))) continue;
+        const ref = hitPartitionCell(layer, { x: g.cx, y: g.cy });
+        if (ref) {
+          onCellMenu?.({
+            ref,
+            rect: partitionCellRefRect(layer, ref),
+            subdivided: partitionIsSubdivided(layer, ref.border),
+            mode: partitionBorderMode(layer, ref.border),
+          });
+          return;
+        }
+      }
+      onCellMenu?.(null);
+    };
+
     // Deep-enough clone of a shape's geometry, for re-baselining a drag's per-frame
     // origin to the latest clamped result.
     const cloneGeom = (s: Square): Square => ({
@@ -739,6 +984,9 @@ export function useCanvasInteractions({
     };
 
     const updateHoverCursor = (e: PointerEvent) => {
+      // Space held → the open hand, the one cursor that means "drag to pan". It outranks
+      // every hover cursor below, matching the pointer-down priority.
+      if (spaceHeld) return setCursor('grab');
       // Layers tool: crosshair while drawing the boundary; resize cursors over boundary edges / cell cuts.
       if (layersActiveRef?.current) {
         const { sx: lx, sy: ly } = localPoint(e);
@@ -746,12 +994,11 @@ export function useCanvasInteractions({
         const world = screenToWorld(lx, ly, cam);
         const doc = partitionDocRef?.current;
         const layer = doc ? partitionActiveLayer(doc) : null;
-        // Edit-a-panel session: hovering a representative-panel edge highlights it (resize cursor); the rest pans.
+        // Edit-a-panel session: hovering ANY selected panel's mullion highlights it (resize cursor); the
+        // rest is inert. Every selected panel is a handle, since the drag drives them all.
         if (frameEditRef?.current) {
-          const sq = frameEditSquare();
-          const hit = sq ? hitShapeEdge(lx, ly, sq, cam) : null;
-          let side: 'n' | 'e' | 's' | 'w' | 'b' | null =
-            hit === 'n' || hit === 'e' || hit === 's' || hit === 'w' ? hit : null;
+          const face = frameEditFaceAt(lx, ly, cam);
+          let side: 'n' | 'e' | 's' | 'w' | 'b' | null = face ? face.side : null;
           // Falling on no axis-aligned face, test the diagonal border-cut edge(s) (grab to set the border frame).
           let borderCursor: string | null = null;
           if (!side) {
@@ -782,59 +1029,77 @@ export function useCanvasInteractions({
           );
           return;
         }
-        const borderMode = borderModeRef?.current ?? true;
         if (!layer || !partitionHasBoundary(layer)) {
-          // No boundary yet → in Border mode drag to draw one; in Panels mode there's nothing to edit.
-          setCursor(borderMode ? 'crosshair' : 'grab');
+          setCursor('grab'); // nothing drawn yet — a boundary arrives via the cube, not a drag
           return;
         }
         const tol = 8 / cam.scale;
-        if (borderMode) {
-          // Border mode: a dimension label (clickable to type a size) → text cursor; then corners, then edges.
-          for (let bi = 0; bi < layer.borders.length; bi++) {
-            const bb = partitionPolyBBox(layer.borders[bi]);
-            const sq: Square = {
-              id: `__border__${bi}`,
-              x: bb.x,
-              y: bb.y,
-              width: bb.w,
-              height: bb.h,
-              rotation: 0,
-              walls: { n: 0, e: 0, s: 0, w: 0 },
-              dots: false,
-            };
-            if (hitDimensionLabel(lx, ly, sq, cam, unitRef.current, BORDER_DIM_GAP)) {
-              setCursor('text');
-              return;
-            }
-          }
-          // Two borders picked & overlapping: track the cursor (live cyan union grid / subtract hatch preview)
-          // and hint that a click acts — taking precedence over the move cursor inside the shared region.
-          if (partitionBorderSelRef && partitionBorderSelRef.current.size === 2) {
-            hoverPointRef.current = { x: lx, y: ly };
-            requestDraw('scene');
-            const bh = borderBooleanHoverAt(layer, partitionBorderSelRef.current, world, tol);
-            if (bh) {
-              setCursor('pointer');
-              return;
-            }
-          }
-          // Only the trim border is editable. Corners win (deform into angles), then edges.
-          if (hitPartitionCorner(layer, world, tol) != null) {
-            setCursor('move');
+        const selBorders = partitionBorderSelRef?.current ?? new Set<number>();
+        // The hover mirrors the press exactly (see the pointer-down pick order). Border affordances come
+        // first but only on a SELECTED border, so an unselected outline never steals the paint cursor.
+        // A dimension label (clickable to type a size) → text cursor.
+        for (const bi of selBorders) {
+          if (bi < 0 || bi >= layer.borders.length) continue;
+          const bb = partitionPolyBBox(layer.borders[bi]);
+          const sq: Square = {
+            id: `__border__${bi}`,
+            x: bb.x,
+            y: bb.y,
+            width: bb.w,
+            height: bb.h,
+            rotation: 0,
+            walls: { n: 0, e: 0, s: 0, w: 0 },
+            dots: false,
+          };
+          if (hitDimensionLabel(lx, ly, sq, cam, unitRef.current, BORDER_DIM_GAP)) {
+            setCursor('text');
             return;
           }
-          const edge = hitPartitionBoundaryEdge(layer, world, tol);
-          if (edge) {
-            setCursor(cursorForBoundaryEdge(edge.edge));
+        }
+        // An edge-plus button on the single-selected shape → the click adds a copy.
+        if (selBorders.size === 1 && (partitionEnteredRef?.current ?? null) !== [...selBorders][0]) {
+          const poly = layer.borders[[...selBorders][0]];
+          if (poly && hitEdgePlus(lx, ly, polygonShape(poly), cam) != null) {
+            setCursor('pointer');
             return;
           }
-          // Inside a border → it can be dragged to move (like a room); empty space pans.
-          setCursor(partitionBorderIndexAt(layer, world) != null ? 'move' : 'grab');
+        }
+        // Two borders picked & overlapping: track the cursor (live cyan union grid / subtract hatch preview)
+        // and hint that a click acts — taking precedence over everything inside the shared region.
+        if (selBorders.size === 2) {
+          hoverPointRef.current = { x: lx, y: ly };
+          requestDraw('scene');
+          if (borderBooleanHoverAt(layer, selBorders, world, tol)) {
+            setCursor('pointer');
+            return;
+          }
+        }
+        // A selected border's vertices (deform), then the rotation ring around them, then its edges.
+        const hoverCorner = hitPartitionCorner(layer, world, tol);
+        if (hoverCorner != null && selBorders.has(hoverCorner.border)) {
+          setCursor('move');
           return;
         }
-        // Panels mode: border is locked — only inner-grid editing.
-        // Shift hovers a single segment; Alt duplicates the line; otherwise a whole inner line.
+        if (selBorders.size === 1 && (partitionEnteredRef?.current ?? null) === null) {
+          const rpoly = layer.borders[[...selBorders][0]];
+          if (rpoly && hitBorderRotateZone(rpoly, lx, ly, cam)) {
+            setCursor(ROTATE_CURSOR);
+            return;
+          }
+        }
+        const hoverEdge = hitPartitionBoundaryEdge(layer, world, tol);
+        if (hoverEdge && selBorders.has(hoverEdge.border)) {
+          setCursor(cursorForBoundaryEdge(hoverEdge.a, hoverEdge.b));
+          return;
+        }
+        // A border the user hasn't stepped into is an object: the whole interior reads as "drag me"
+        // (Alt = drop a copy). Its contents are sealed until a double-click goes in.
+        const hoverIdx = partitionBorderIndexAt(layer, world);
+        if (hoverIdx != null && hoverIdx !== (partitionEnteredRef?.current ?? null)) {
+          setCursor(e.altKey ? 'copy' : 'move');
+          return;
+        }
+        // Inner grid: Shift hovers a single segment; Alt duplicates the line; otherwise a whole inner line.
         if (e.shiftKey) {
           const seg = hitPartitionGridSegment(layer, world, tol);
           if (seg) {
@@ -854,7 +1119,8 @@ export function useCanvasInteractions({
             return;
           }
         }
-        setCursor('grab');
+        // Inside the entered shape with nothing structural in the way → the brush. Outside → sweep.
+        setCursor(hoverIdx != null ? 'cell' : 'crosshair');
         return;
       }
       // Footprint tool armed → the whole canvas is a draw surface (crosshair).
@@ -1022,7 +1288,7 @@ export function useCanvasInteractions({
         return setCursor('text');
       }
       if (hitEdge) return setCursor(cursorForHandle(hitEdge.handle, hitEdge.shape));
-      setCursor(hover ? 'move' : 'grab');
+      setCursor(hover ? 'move' : 'default');
     };
 
     const onPointerDown = (e: PointerEvent) => {
@@ -1050,8 +1316,20 @@ export function useCanvasInteractions({
       centerHoverRef.current = null; // hide the editable-readout box during gestures
       edgePlusHoverRef.current = null; // clear any duplicate-preview ghost
 
+      // 0!) Space held → pan, whatever is under the cursor (room, handle, Layers border).
+      //     This is the only gesture that moves the camera; every other press below
+      //     selects or edits.
+      if (spaceHeld) {
+        mode = 'pan';
+        lastClientX = e.clientX;
+        lastClientY = e.clientY;
+        setCursor('grabbing');
+        capturePointer(e.pointerId);
+        return;
+      }
+
       // 0a) Layers tool (Facade partition) fully owns the gesture: draw the boundary if there isn't one,
-      //     else stretch a boundary edge / cell cut; empty space pans. Room interaction is bypassed.
+      //     else stretch a boundary edge / cell cut; empty space rubber-band selects. Room interaction is bypassed.
       if (layersActiveRef?.current) {
         // An armed border placement (from the cube) commits on the next canvas click, even though the
         // Layers tool otherwise owns the gesture — this block returns before the shared placement check below.
@@ -1068,18 +1346,25 @@ export function useCanvasInteractions({
         partitionSeg = null;
         partitionSegExtra = null;
         partitionCellCandidate = null;
+        paintBase = null;
+        painted = new Set();
+        paintLast = null;
+        partitionPlus = null;
+        partitionRotate = null;
+        if (partitionPlusRef) partitionPlusRef.current = null;
         partitionMutated = false;
         frameEditSide = null;
         frameEditOrig = null;
         frameEditBorder = null;
         // Edit-a-panel session owns the gesture: grab a representative-panel edge to set its frame width
-        // (mirrored to the group); anywhere else pans.
+        // (mirrored to the group); anywhere else is inert.
         if (frameEditRef?.current) {
           const world = screenToWorld(sx, sy, cam);
-          const sq = frameEditSquare();
-          const hit = sq ? hitShapeEdge(sx, sy, sq, cam) : null;
-          const side = hit === 'n' || hit === 'e' || hit === 's' || hit === 'w' ? hit : null;
-          if (sq && side) {
+          // Grab the mullion of ANY selected panel — whichever is under the cursor becomes the drag basis,
+          // and the resulting width is written to every panel in the selection.
+          const face = frameEditFaceAt(sx, sy, cam);
+          if (face) {
+            const { sq, side } = face;
             mode = 'partitionFrame';
             frameEditSide = side;
             frameEditOrig = sq;
@@ -1088,7 +1373,7 @@ export function useCanvasInteractions({
             frameEditRef.current.hoverSide = side;
             frameEditRef.current.allSides = frameEditAll;
             setCursor(side === 'n' || side === 's' ? 'row-resize' : 'col-resize');
-            el.setPointerCapture(e.pointerId);
+            capturePointer(e.pointerId);
             return;
           }
           // Grab the nearest diagonal border-cut frame edge → drag to set the border ('b') mullion width.
@@ -1109,40 +1394,59 @@ export function useCanvasInteractions({
               frameEditRef.current.hoverSide = 'b';
               frameEditRef.current.allSides = frameEditAll;
               setCursor(cursorForNormal(bi.nx, bi.ny));
-              el.setPointerCapture(e.pointerId);
+              capturePointer(e.pointerId);
               return;
             }
           }
-          mode = 'pan';
-          lastClientX = e.clientX;
-          lastClientY = e.clientY;
-          setCursor('grabbing');
-          el.setPointerCapture(e.pointerId);
+          // Off every frame edge: an inert press. A clean click here ends the session
+          // (handled on pointer-up); Space-drag is what pans.
+          mode = 'none';
           return;
         }
-        // Shift-drag BEGINNING OUTSIDE the trim border → rubber-band multi-select of panel groups (additive).
+        // Shift-drag BEGINNING OUTSIDE the trim border → rubber-band multi-select of panel groups, ADDING to
+        // the current selection (the plain sweep below replaces it instead).
         // Inside the border, Shift keeps its existing meaning (grab a segment); outside there's nothing to grab.
-        if (layer && partitionHasBoundary(layer) && e.shiftKey && partitionGroupSelRef) {
+        if (layer && partitionHasBoundary(layer) && e.shiftKey && partitionCellSelRef) {
           const world = screenToWorld(sx, sy, cam);
           if (!partitionPointInBorder(layer, world)) {
             mode = 'partitionMarquee';
             marqueeRef.current = { x0: sx, y0: sy, x1: sx, y1: sy };
             setCursor('crosshair');
-            el.setPointerCapture(e.pointerId);
+            capturePointer(e.pointerId);
             return;
           }
         }
-        const borderMode = borderModeRef?.current ?? true;
-        // Border mode: the trim border is the only editable thing — draw it / deform corners / slide edges.
-        if (layer && borderMode) {
+        // ONE editing mode. What the cursor is over — and what is currently selected — decides the gesture;
+        // there is no Border/Panels switch. Pick order, most specific first:
+        //
+        //   1. a selected border's dimension label   → type a size
+        //   2. a boolean over two picked borders     → unite / subtract
+        //   3. a SELECTED border's corner or edge    → deform / stretch  (selecting reveals the handles)
+        //   4. an inner grid line or segment         → move / duplicate the mullion
+        //   5. anywhere else inside a border         → PAINT panel selection (drag) or pick a group (click)
+        //   6. outside every border                  → rubber-band marquee
+        //
+        // Border geometry lives at 3 because a border becomes selected by clicking inside it (step 5's
+        // click also picks the border), so "click the shape, then drag its edges/vertices" works without
+        // ever leaving panel editing.
+        if (layer) {
           const world = screenToWorld(sx, sy, cam);
           // Borders are placed via the cube (armed placement); there is no drag-to-draw here. With no border
-          // yet, fall through to pan.
+          // yet, fall through to the empty-space branch below.
           if (partitionHasBoundary(layer)) {
             const tol = 9 / cam.scale;
+            const selBorders = partitionBorderSelRef?.current ?? new Set<number>();
+            const enteredIdx = partitionEnteredRef?.current ?? null;
             // A border's own width/height dimension label (sits outside the trim) → edit it by typing, exactly
-            // like a room/footprint dimension. Tested first since labels hang clear of the corners/edges.
-            for (let bi = 0; bi < layer.borders.length; bi++) {
+            // like a room/footprint dimension. Tested first since labels hang clear of the corners/edges. Only
+            // the single-selected border draws them, so only it can be hit — otherwise a click in the empty
+            // space where a hidden label WOULD sit would open an invisible editor.
+            const dimBorders =
+              partitionBorderSelRef && partitionBorderSelRef.current.size === 1
+                ? [...partitionBorderSelRef.current]
+                : [];
+            for (const bi of dimBorders) {
+              if (bi < 0 || bi >= layer.borders.length) continue;
               const bb = partitionPolyBBox(layer.borders[bi]);
               const sq: Square = {
                 id: `__border__${bi}`,
@@ -1161,162 +1465,265 @@ export function useCanvasInteractions({
                 return;
               }
             }
-            // A trim corner wins (deform into an angle); then a border edge (slide to reveal more cells).
-            const corner = hitPartitionCorner(layer, world, tol);
-            if (corner != null) {
-              mode = 'cornerDrag';
-              partitionCorner = corner.corner;
-              partitionCornerBorder = corner.border;
-              setCursor('move');
-              el.setPointerCapture(e.pointerId);
-              return;
+            // An edge-plus button on the single-selected shape → duplicate it that way, exactly like the
+            // Plan-mode room buttons: a clean click drops one copy against that side, dragging outward runs
+            // a row. Tested here with the other affordances that hang OUTSIDE the outline, before anything
+            // that hit-tests the border itself. Hidden (so inert) while inside a shape.
+            if (
+              selBorders.size === 1 &&
+              enteredIdx !== [...selBorders][0] &&
+              partitionBorderSelRef
+            ) {
+              const bi = [...selBorders][0];
+              const poly = layer.borders[bi];
+              const shape = poly ? polygonShape(poly) : null;
+              const dir = shape ? hitEdgePlus(sx, sy, shape, cam) : null;
+              if (shape && dir != null) {
+                e.preventDefault();
+                const { dx, dy } = adjacentCopyOffset(shape, dir);
+                mode = 'partitionPlus';
+                partitionPlus = {
+                  border: bi,
+                  dir,
+                  stepX: dx,
+                  stepY: dy,
+                  startX: world.x,
+                  startY: world.y,
+                  count: 1,
+                };
+                if (partitionPlusRef) partitionPlusRef.current = { border: bi, dx, dy, count: 1 };
+                capturePointer(e.pointerId);
+                requestDraw('scene');
+                return;
+              }
             }
-            const edge = hitPartitionBoundaryEdge(layer, world, tol);
-            if (edge) {
-              mode = 'boundaryEdge';
-              partitionEdge = edge.edge;
-              partitionEdgeBorder = edge.border;
-              partitionEdgeOrig = layer.borders[edge.border].map((p) => ({ x: p.x, y: p.y }));
-              partitionEdgeStart = { x: world.x, y: world.y };
-              setCursor(cursorForBoundaryEdge(edge.edge));
-              el.setPointerCapture(e.pointerId);
-              return;
-            }
-            // Click-drag from a border's INTERIOR → move that border (like a room). Each border carries its own
-            // lattice/panels rigidly, so moving one never disturbs another's pattern. Empty space falls to pan.
-            const moveIdx = partitionBorderIndexAt(layer, world);
-            // Two borders picked & overlapping: a clean click in their shared interior UNITES them; on a
-            // bounding edge it SUBTRACTS that edge's border from the other (Plan-mode booleans). We still arm
-            // a border move so a drag past the click slop pulls the border apart instead; the boolean only
-            // fires on a clean release (handled on pointer-up).
+            // Two borders picked & overlapping: the boolean claims the click BEFORE corner/edge editing,
+            // matching the hover feedback exactly (pointer cursor + the cyan union grid / subtract hatch).
+            // It has to come first: the difference trigger IS an edge of one border lying inside the other,
+            // so the edge hit-test below would otherwise grab those very edges for a stretch and difference
+            // could never fire. Outside the shared region nothing changes — those edges still stretch. A
+            // border move is still armed so a drag past the click slop pulls the two apart instead; the
+            // boolean only fires on a clean release (handled on pointer-up).
             if (!e.shiftKey && partitionBorderSelRef && partitionBorderSelRef.current.size === 2) {
               const bh = borderBooleanHoverAt(layer, partitionBorderSelRef.current, world, tol);
               if (bh) {
                 pendingBorderBool = bh;
-                const mi = moveIdx ?? (bh.kind === 'union' ? bh.a : bh.target);
+                const mi =
+                  partitionBorderIndexAt(layer, world) ??
+                  (bh.kind === 'union' ? bh.a : bh.target);
                 mode = 'borderMove';
                 partitionMoveBorder = mi;
                 partitionMoveStart = { x: world.x, y: world.y };
                 partitionMoveOrig = layer.borders[mi].map((p) => ({ x: p.x, y: p.y }));
                 snapState = emptySnapState();
                 setCursor('move');
-                el.setPointerCapture(e.pointerId);
+                capturePointer(e.pointerId);
                 return;
               }
             }
-            if (moveIdx != null) {
-              // Shift-click toggles a border in the boolean-op selection (no move). Insertion order is kept, so
-              // the first-picked border is the difference target by default.
-              if (e.shiftKey && partitionBorderSelRef) {
-                const sel = new Set(partitionBorderSelRef.current);
-                if (sel.has(moveIdx)) sel.delete(moveIdx);
-                else sel.add(moveIdx);
-                partitionBorderSelRef.current = sel;
-                requestDraw('scene');
-                return;
-              }
-              // A plain click single-selects the border it grabs (clears any multi-pick) and starts the move.
-              if (partitionBorderSelRef) partitionBorderSelRef.current = new Set([moveIdx]);
-              mode = 'borderMove';
-              partitionMoveBorder = moveIdx;
-              partitionMoveStart = { x: world.x, y: world.y };
-              partitionMoveOrig = layer.borders[moveIdx].map((p) => ({ x: p.x, y: p.y }));
-              snapState = emptySnapState();
+            // Border geometry — but ONLY on a border the user has already selected, so an unselected
+            // outline never steals a gesture. Corner wins (deform into an angle), then edge (slide).
+            const corner = hitPartitionCorner(layer, world, tol);
+            if (corner != null && selBorders.has(corner.border)) {
+              mode = 'cornerDrag';
+              partitionCorner = corner.corner;
+              partitionCornerBorder = corner.border;
               setCursor('move');
-              el.setPointerCapture(e.pointerId);
+              capturePointer(e.pointerId);
               return;
             }
-            // Clicked empty space inside the layer (no border/corner/edge) → drop any boolean-op pick.
+            // ...then the rotation ring just BEYOND that corner, where the arc is drawn. Inner target
+            // first: the grip sits ON the corner (deform), the ring around it turns the whole shape — the
+            // same nesting a selected room uses in Plan mode.
+            if (selBorders.size === 1 && enteredIdx === null) {
+              const rbi = [...selBorders][0];
+              const rpoly = layer.borders[rbi];
+              if (rpoly && hitBorderRotateZone(rpoly, sx, sy, cam)) {
+                const bb = partitionPolyBBox(rpoly);
+                const cx = bb.x + bb.w / 2;
+                const cy = bb.y + bb.h / 2;
+                mode = 'partitionRotate';
+                partitionRotate = {
+                  border: rbi,
+                  orig: rpoly.map((p) => ({ x: p.x, y: p.y })),
+                  startAngle: Math.atan2(world.y - cy, world.x - cx) * (180 / Math.PI),
+                };
+                setCursor(ROTATE_CURSOR);
+                capturePointer(e.pointerId);
+                return;
+              }
+            }
+            const edge = hitPartitionBoundaryEdge(layer, world, tol);
+            if (edge && selBorders.has(edge.border)) {
+              mode = 'boundaryEdge';
+              partitionEdge = edge.edge;
+              partitionEdgeBorder = edge.border;
+              partitionEdgeOrig = layer.borders[edge.border].map((p) => ({ x: p.x, y: p.y }));
+              partitionEdgeStart = { x: world.x, y: world.y };
+              setCursor(cursorForBoundaryEdge(edge.a, edge.b));
+              capturePointer(e.pointerId);
+              return;
+            }
+            const moveIdx = partitionBorderIndexAt(layer, world);
+            // A border the user has NOT stepped into is a SHAPE, and behaves like one: the press selects it
+            // and a drag moves it bodily (Alt drops a copy and drags that, like Alt-dragging a room). Its
+            // contents are sealed — no mullion grabs, no cell painting — because a press inside it can only
+            // sensibly mean one thing, and at shape level that thing is "move me". Double-click to go in.
+            if (moveIdx != null && moveIdx !== enteredIdx) {
+              let dragIdx = moveIdx;
+              if (e.altKey) {
+                const copy = partitionDuplicateBorder(layer, moveIdx);
+                if (copy != null) {
+                  dragIdx = copy;
+                  partitionMutated = true; // the Layers path's own "commit one undo step" flag
+                }
+              }
+              if (partitionBorderSelRef) {
+                // Shift adds to the pick (that's how two are armed for a boolean); plain replaces it.
+                if (e.shiftKey && !e.altKey) {
+                  const next = new Set(partitionBorderSelRef.current);
+                  if (next.has(dragIdx)) next.delete(dragIdx);
+                  else next.add(dragIdx);
+                  partitionBorderSelRef.current = next;
+                } else {
+                  partitionBorderSelRef.current = new Set([dragIdx]);
+                }
+              }
+              // Stepping from one shape into another isn't a thing — leaving this one exits.
+              if (partitionEnteredRef) partitionEnteredRef.current = null;
+              onCellMenu?.(null);
+              mode = 'borderMove';
+              partitionMoveBorder = dragIdx;
+              partitionMoveStart = { x: world.x, y: world.y };
+              partitionMoveOrig = layer.borders[dragIdx].map((p) => ({ x: p.x, y: p.y }));
+              snapState = emptySnapState();
+              setCursor('move');
+              capturePointer(e.pointerId);
+              requestDraw('scene');
+              return;
+            }
+            // --- Inside the entered shape: its contents are what the pointer edits. Everything below
+            // is unreachable until the user double-clicks in, which is what frees the plain drag above
+            // to move the shape instead of being swallowed by a cell selection. ---
+            if (moveIdx != null && moveIdx === enteredIdx) {
+              // Alt → DUPLICATE. If a single segment is selected, copy just that segment (a partial divider);
+              // otherwise copy the whole line under the cursor. Shift → grab a single SEGMENT (select + jog
+              // it). Plain → drag the whole line (Excel-style).
+              if (e.altKey && partitionSelSegRef?.current) {
+                const dupSeg = duplicatePartitionSegment(layer, partitionSelSegRef.current);
+                if (dupSeg) {
+                  mode = 'segExtraDrag';
+                  partitionSegExtra = dupSeg;
+                  partitionMutated = true; // the copied segment exists even without a drag
+                  setCursor(dupSeg.axis === 'v' ? 'col-resize' : 'row-resize');
+                  capturePointer(e.pointerId);
+                  requestDraw('scene');
+                  return;
+                }
+              }
+              if (e.altKey) {
+                const line = hitPartitionLine(layer, world, tol);
+                if (line) {
+                  const pos = line.axis === 'v' ? world.x : world.y;
+                  const dup = duplicatePartitionLine(layer, line.border, line.axis, pos);
+                  if (dup) {
+                    mode = 'lineDrag';
+                    partitionLine = dup;
+                    partitionMutated = true; // the duplicate exists even without a drag
+                    if (partitionSelSegRef?.current) partitionSelSegRef.current = null;
+                    setCursor(dup.axis === 'v' ? 'col-resize' : 'row-resize');
+                    capturePointer(e.pointerId);
+                    requestDraw('scene');
+                    return;
+                  }
+                }
+              } else if (e.shiftKey) {
+                // Over a mullion Shift still grabs a single SEGMENT; over a cell it means "add to the
+                // selection". The two never compete for the same pixel, so both readings coexist.
+                const seg = hitPartitionGridSegment(layer, world, tol);
+                if (seg) {
+                  mode = 'segmentDrag';
+                  partitionSeg = seg;
+                  if (partitionSelSegRef) partitionSelSegRef.current = seg;
+                  setCursor(seg.axis === 'v' ? 'col-resize' : 'row-resize');
+                  capturePointer(e.pointerId);
+                  requestDraw('scene');
+                  return;
+                }
+              } else {
+                // An already-split segment moves on a plain drag (no Shift) — it behaves like a normal line now.
+                const splitSeg = hitPartitionGridSegment(layer, world, tol);
+                if (splitSeg && partitionIsSplitSegment(layer, splitSeg)) {
+                  mode = 'segmentDrag';
+                  partitionSeg = splitSeg;
+                  if (partitionSelSegRef) partitionSelSegRef.current = splitSeg;
+                  setCursor(splitSeg.axis === 'v' ? 'col-resize' : 'row-resize');
+                  capturePointer(e.pointerId);
+                  requestDraw('scene');
+                  return;
+                }
+                // A plain click anywhere in the grid clears the segment selection.
+                if (partitionSelSegRef?.current) {
+                  partitionSelSegRef.current = null;
+                  requestDraw('scene');
+                }
+                const line = hitPartitionLine(layer, world, tol);
+                if (line) {
+                  mode = 'lineDrag';
+                  partitionLine = line;
+                  setCursor(line.axis === 'v' ? 'col-resize' : 'row-resize');
+                  capturePointer(e.pointerId);
+                  return;
+                }
+              }
+              // Nothing structural under the cursor: this press is about the panels. It arms both readings
+              // and lets the release decide — a click takes the panel's whole material group, any movement
+              // turns the same press into a paint stroke over individual cells.
+              if (partitionCellSelRef && partitionCellGroupAt(layer, world)) {
+                partitionCellCandidate = { x: world.x, y: world.y, shift: e.shiftKey };
+                // Shift extends the existing selection; a plain stroke starts empty, so it replaces.
+                paintBase = e.shiftKey ? new Set(partitionCellSelRef.current) : new Set();
+                painted = new Set();
+                paintLast = { x: world.x, y: world.y };
+                mode = 'partitionPaint';
+              }
+              capturePointer(e.pointerId);
+              return;
+            }
+            // Outside every border → step back out of whatever was entered and drop any boolean-op pick.
+            if (partitionEnteredRef?.current != null) {
+              partitionEnteredRef.current = null;
+              if (partitionCellSelRef) partitionCellSelRef.current = new Set();
+              onCellMenu?.(null);
+              requestDraw('scene');
+            }
             if (partitionBorderSelRef?.current.size) {
               partitionBorderSelRef.current = new Set();
               requestDraw('scene');
             }
           }
-          // Nothing border-related hit → fall through to pan (no panel editing in Border mode).
-        } else if (layer && partitionHasBoundary(layer)) {
-          // Panels mode: the border is LOCKED — edit only the inner grid (lines / segments / panel groups).
+        }
+        // Empty space OUTSIDE the trim border → rubber-band multi-select of panel groups,
+        // the same sweep the Shift branch above runs, now the plain default. Clearing the
+        // selection first makes a plain sweep replace it (the sweep itself is additive) and
+        // a no-drag click deselect. Inside the border the press stays inert so the armed
+        // group-select still resolves on pointer-up. Panning is Space-drag only.
+        if (layer && partitionHasBoundary(layer) && partitionCellSelRef) {
           const world = screenToWorld(sx, sy, cam);
-          const tol = 9 / cam.scale;
-          // Alt → DUPLICATE. If a single segment is selected, copy just that segment (a partial divider);
-          // otherwise copy the whole line under the cursor. Shift → grab a single SEGMENT (select + jog
-          // it). Plain → drag the whole line (Excel-style).
-          if (e.altKey && partitionSelSegRef?.current) {
-            const dupSeg = duplicatePartitionSegment(layer, partitionSelSegRef.current);
-            if (dupSeg) {
-              mode = 'segExtraDrag';
-              partitionSegExtra = dupSeg;
-              partitionMutated = true; // the copied segment exists even without a drag
-              setCursor(dupSeg.axis === 'v' ? 'col-resize' : 'row-resize');
-              el.setPointerCapture(e.pointerId);
-              requestDraw('scene');
-              return;
-            }
-          }
-          if (e.altKey) {
-            const line = hitPartitionLine(layer, world, tol);
-            if (line) {
-              const pos = line.axis === 'v' ? world.x : world.y;
-              const dup = duplicatePartitionLine(layer, line.border, line.axis, pos);
-              if (dup) {
-                mode = 'lineDrag';
-                partitionLine = dup;
-                partitionMutated = true; // the duplicate exists even without a drag
-                if (partitionSelSegRef?.current) partitionSelSegRef.current = null;
-                setCursor(dup.axis === 'v' ? 'col-resize' : 'row-resize');
-                el.setPointerCapture(e.pointerId);
-                requestDraw('scene');
-                return;
-              }
-            }
-          } else if (e.shiftKey) {
-            const seg = hitPartitionGridSegment(layer, world, tol);
-            if (seg) {
-              mode = 'segmentDrag';
-              partitionSeg = seg;
-              if (partitionSelSegRef) partitionSelSegRef.current = seg;
-              setCursor(seg.axis === 'v' ? 'col-resize' : 'row-resize');
-              el.setPointerCapture(e.pointerId);
-              requestDraw('scene');
-              return;
-            }
-          } else {
-            // An already-split segment moves on a plain drag (no Shift) — it behaves like a normal line now.
-            const splitSeg = hitPartitionGridSegment(layer, world, tol);
-            if (splitSeg && partitionIsSplitSegment(layer, splitSeg)) {
-              mode = 'segmentDrag';
-              partitionSeg = splitSeg;
-              if (partitionSelSegRef) partitionSelSegRef.current = splitSeg;
-              setCursor(splitSeg.axis === 'v' ? 'col-resize' : 'row-resize');
-              el.setPointerCapture(e.pointerId);
-              requestDraw('scene');
-              return;
-            }
-            // A plain click anywhere in the grid clears the segment selection.
-            if (partitionSelSegRef?.current) {
-              partitionSelSegRef.current = null;
+          if (!partitionPointInBorder(layer, world)) {
+            if (partitionCellSelRef.current.size) {
+              partitionCellSelRef.current = new Set();
+              onCellMenu?.(null); // the bar belongs to the selection it was cleared with
               requestDraw('scene');
             }
-            const line = hitPartitionLine(layer, world, tol);
-            if (line) {
-              mode = 'lineDrag';
-              partitionLine = line;
-              setCursor(line.axis === 'v' ? 'col-resize' : 'row-resize');
-              el.setPointerCapture(e.pointerId);
-              return;
-            }
-          }
-          // No line/edge/corner/segment hit: if the cursor is inside a panel, arm a group-select (applied
-          // on a clean release); a drag from here still pans.
-          if (partitionGroupSelRef && partitionCellGroupAt(layer, world)) {
-            partitionCellCandidate = { x: world.x, y: world.y, shift: e.shiftKey };
+            mode = 'partitionMarquee';
+            marqueeRef.current = { x0: sx, y0: sy, x1: sx, y1: sy };
+            setCursor('crosshair');
+            capturePointer(e.pointerId);
+            return;
           }
         }
-        // Empty space → pan.
-        mode = 'pan';
-        lastClientX = e.clientX;
-        lastClientY = e.clientY;
-        setCursor('grabbing');
-        el.setPointerCapture(e.pointerId);
+        mode = 'none';
         return;
       }
 
@@ -1353,18 +1760,19 @@ export function useCanvasInteractions({
         footprintDraftRef.current = { id: createId(), x: w0.x, y: w0.y, width: 0, height: 0 };
         mode = 'footdraw';
         setCursor('crosshair');
-        el.setPointerCapture(e.pointerId);
+        capturePointer(e.pointerId);
         return;
       }
 
-      // 1) Shift → rubber-band marquee selection — UNLESS the cursor is on an armed
-      //    magenta edge face, where Shift instead drags all walls' faces at once
-      //    (handled by the thickness branch below).
+      // 1) Shift → ADDITIVE rubber-band marquee from anywhere, including over a room
+      //    (a bare drag there moves it; branch 5 gives the bare marquee off empty space).
+      //    UNLESS the cursor is on an armed magenta edge face, where Shift instead drags
+      //    all walls' faces at once (handled by the thickness branch below).
       if (e.shiftKey && !grabbedFace) {
         mode = 'marquee';
         marqueeRef.current = { x0: sx, y0: sy, x1: sx, y1: sy };
         setCursor('crosshair');
-        el.setPointerCapture(e.pointerId);
+        capturePointer(e.pointerId);
         return;
       }
 
@@ -1404,7 +1812,7 @@ export function useCanvasInteractions({
             };
             edgePlusHoverRef.current = null; // no duplicate ghost in this mode
             setCursor('pointer');
-            el.setPointerCapture(e.pointerId);
+            capturePointer(e.pointerId);
             return;
           }
           const { dx, dy } = adjacentCopyOffset(single, dir);
@@ -1419,7 +1827,7 @@ export function useCanvasInteractions({
             count: 1,
           };
           edgePlusHoverRef.current = { id: single.id, dir, count: 1 };
-          el.setPointerCapture(e.pointerId);
+          capturePointer(e.pointerId);
           requestDraw('scene');
           return;
         }
@@ -1490,7 +1898,7 @@ export function useCanvasInteractions({
         rotateStartAngle = Math.atan2(world.y - cy, world.x - cx) * (180 / Math.PI);
         rotateStartRotation = single.rotation;
         setCursor(ROTATE_CURSOR);
-        el.setPointerCapture(e.pointerId);
+        capturePointer(e.pointerId);
         return;
       }
 
@@ -1512,7 +1920,7 @@ export function useCanvasInteractions({
         edgeFaceAllRef.current = thicknessAll;
         snapshotSelection(world);
         setCursor(cursorForHandle(activeEdge, single));
-        el.setPointerCapture(e.pointerId);
+        capturePointer(e.pointerId);
         return;
       }
 
@@ -1534,7 +1942,7 @@ export function useCanvasInteractions({
         handle = dot.handle;
         snapshotSelection(world);
         setCursor('default'); // plain pointer while dragging a vertex point
-        el.setPointerCapture(e.pointerId);
+        capturePointer(e.pointerId);
         requestDraw('scene');
         return;
       }
@@ -1576,7 +1984,7 @@ export function useCanvasInteractions({
         wallDimsArmedRef.current = false;
         snapshotSelection(world);
         setCursor(cursorForHandle(edge.handle, edge.shape));
-        el.setPointerCapture(e.pointerId);
+        capturePointer(e.pointerId);
         requestDraw('scene');
         return;
       }
@@ -1597,7 +2005,7 @@ export function useCanvasInteractions({
         mode = 'move';
         snapshotSelection(world);
         setCursor('move');
-        el.setPointerCapture(e.pointerId);
+        capturePointer(e.pointerId);
         requestDraw('scene');
         return;
       }
@@ -1613,17 +2021,20 @@ export function useCanvasInteractions({
         }
       }
 
-      // 5) Empty space → deselect and pan.
+      // 5) Empty space → rubber-band marquee select (no modifier needed). Dropping the
+      //    old selection here is what makes a plain sweep REPLACE it: the marquee itself
+      //    is additive, so what it sweeps becomes the whole new selection, and a click
+      //    with no drag sweeps nothing and simply deselects. (Shift skips the clear via
+      //    branch 1, so a Shift-sweep extends instead.) Panning is Space-drag only.
       if (selectionRef.current.size > 0) {
         selectionRef.current = new Set();
         activeEdgeRef.current = null;
         requestDraw('scene');
       }
-      mode = 'pan';
-      lastClientX = e.clientX;
-      lastClientY = e.clientY;
-      setCursor('grabbing');
-      el.setPointerCapture(e.pointerId);
+      mode = 'marquee';
+      marqueeRef.current = { x0: sx, y0: sy, x1: sx, y1: sy };
+      setCursor('crosshair');
+      capturePointer(e.pointerId);
     };
 
     const onPointerMove = (e: PointerEvent) => {
@@ -1683,6 +2094,65 @@ export function useCanvasInteractions({
         return;
       }
 
+      // Rotate a border about its bounding-box centre, snapped to ROTATION_SNAP_DEG like a room. The angle
+      // is measured from the grab, so the grabbed corner tracks the cursor, and applied to the ORIGINAL
+      // outline each frame rather than compounding onto the live one.
+      if (mode === 'partitionRotate' && partitionRotate && partitionDocRef?.current) {
+        const { sx: rx, sy: ry } = localPoint(e);
+        const rw = screenToWorld(rx, ry, cam);
+        const layer = partitionActiveLayer(partitionDocRef.current);
+        const bb = partitionPolyBBox(partitionRotate.orig);
+        const cx = bb.x + bb.w / 2;
+        const cy = bb.y + bb.h / 2;
+        const angle = Math.atan2(rw.y - cy, rw.x - cx) * (180 / Math.PI);
+        const raw = angle - partitionRotate.startAngle;
+        const deg = Math.round(raw / ROTATION_SNAP_DEG) * ROTATION_SNAP_DEG;
+        // Keep per-group frames attached as the rotated boundary re-slices the panels it clips.
+        partitionPreserveFrames(layer, () =>
+          rotatePartitionBorder(layer, partitionRotate!.border, partitionRotate!.orig, deg),
+        );
+        partitionMutated = true;
+        requestDraw('scene');
+        return;
+      }
+
+      // Edge-plus duplicate on a border: copy count = how many shape-lengths the cursor has travelled
+      // outward along the duplicate direction, at least one. Same rule as the Plan-mode room buttons.
+      if (mode === 'partitionPlus' && partitionPlus) {
+        const { sx: px, sy: py } = localPoint(e);
+        const pw = screenToWorld(px, py, cam);
+        const stepLen = Math.hypot(partitionPlus.stepX, partitionPlus.stepY) || 1;
+        const ux = partitionPlus.stepX / stepLen;
+        const uy = partitionPlus.stepY / stepLen;
+        const projected = (pw.x - partitionPlus.startX) * ux + (pw.y - partitionPlus.startY) * uy;
+        const count = Math.max(1, Math.min(MAX_PLUS_COPIES, Math.floor(projected / stepLen) + 1));
+        if (count !== partitionPlus.count) {
+          partitionPlus.count = count;
+          if (partitionPlusRef) {
+            partitionPlusRef.current = {
+              border: partitionPlus.border,
+              dx: partitionPlus.stepX,
+              dy: partitionPlus.stepY,
+              count,
+            };
+          }
+          requestDraw('scene');
+        }
+        return;
+      }
+
+      // Paint-select: brush panels into the selection as the cursor sweeps over them. The highlight updates
+      // live, so the user sees exactly what they are picking up while they drag. Nothing is painted until
+      // the press clears the click slop — inside it the gesture may still resolve as a click, and a click
+      // means something different (take the whole material group), so it must not disturb the selection.
+      if (mode === 'partitionPaint' && partitionDocRef?.current) {
+        if (!draggedSinceDown) return;
+        const { sx, sy } = localPoint(e);
+        paintTo(partitionActiveLayer(partitionDocRef.current), screenToWorld(sx, sy, cam));
+        requestDraw('scene');
+        return;
+      }
+
       if (mode === 'footdraw') {
         const { sx, sy } = localPoint(e);
         const w = screenToWorld(sx, sy, cam);
@@ -1713,9 +2183,9 @@ export function useCanvasInteractions({
         const doc = partitionDocRef?.current;
         if (doc) {
           const layer = partitionActiveLayer(doc);
-          const cur = partitionGroupFrame(layer, frameEditRef.current.keys[0]);
+          const cur = partitionPanelFrame(layer, frameEditRef.current.keys[0]);
           const next = frameEditAll ? { n: b, e: b, s: b, w: b, b } : cur ? { ...cur, b } : null;
-          if (next) partitionSetGroupFrame(layer, frameEditRef.current.keys, next);
+          if (next) partitionSetPanelFrame(layer, frameEditRef.current.keys, next);
           partitionMutated = true;
           requestDraw('scene');
         }
@@ -1736,8 +2206,8 @@ export function useCanvasInteractions({
           : resizeWall(frameEditOrig, frameEditSide, 'inner', dx, dy, MIN_WALL_WORLD, minInterior);
         const doc = partitionDocRef?.current;
         if (doc) {
-          const cur = partitionGroupFrame(partitionActiveLayer(doc), frameEditRef.current.keys[0]);
-          partitionSetGroupFrame(partitionActiveLayer(doc), frameEditRef.current.keys, {
+          const cur = partitionPanelFrame(partitionActiveLayer(doc), frameEditRef.current.keys[0]);
+          partitionSetPanelFrame(partitionActiveLayer(doc), frameEditRef.current.keys, {
             n: next.walls.n,
             e: next.walls.e,
             s: next.walls.s,
@@ -1771,10 +2241,10 @@ export function useCanvasInteractions({
         // Snap the FREE delta (from grab) onto a nearby OTHER border's edge/corner, surfacing the green guides,
         // exactly like a room move. Then apply it as an incremental delta against the live quad so
         // movePartitionBorder's per-border lattice carry-along stays intact.
-        const dragged = borderToSquare(partitionMoveOrig);
+        const dragged = polygonShape(partitionMoveOrig);
         const statics: Square[] = [];
         layer.borders.forEach((poly, i) => {
-          if (i !== partitionMoveBorder) statics.push(borderToSquare(poly));
+          if (i !== partitionMoveBorder) statics.push(polygonShape(poly));
         });
         const freeDx = world.x - partitionMoveStart.x;
         const freeDy = world.y - partitionMoveStart.y;
@@ -1783,19 +2253,31 @@ export function useCanvasInteractions({
         const live = layer.borders[partitionMoveBorder];
         const targetX = partitionMoveOrig[0].x + snapped.dx;
         const targetY = partitionMoveOrig[0].y + snapped.dy;
-        movePartitionBorder(layer, partitionMoveBorder, targetX - live[0].x, targetY - live[0].y);
+        // Carry each panel's frame and material along with it. Panel properties are keyed by cell POSITION,
+        // and a move translates every cell — so without this the whole elevation's materials orphan the
+        // instant the shape is nudged, while the lattice itself (stored as a grid, not by position)
+        // survives. Every other geometry gesture already wraps its mutation this way.
+        partitionPreserveFrames(layer, () =>
+          movePartitionBorder(layer, partitionMoveBorder!, targetX - live[0].x, targetY - live[0].y),
+        );
         partitionMutated = true;
         requestDraw('scene');
         return;
       }
-      if (mode === 'boundaryEdge' && partitionEdge && partitionEdgeOrig && partitionDocRef?.current) {
+      // `partitionEdge` is an index, so 0 is a valid edge — compare against null, not truthiness.
+      if (mode === 'boundaryEdge' && partitionEdge != null && partitionEdgeOrig && partitionDocRef?.current) {
         // Reuse the room/shape edge stretch: offsets the grabbed edge along its outward normal and slides
         // the endpoints along the two adjacent edges — so an angled border edge behaves like a default shape.
         const layer = partitionActiveLayer(partitionDocRef.current);
-        const borderSquare = borderToSquare(partitionEdgeOrig);
+        const borderSquare = polygonShape(partitionEdgeOrig);
         // Keep per-group frames attached as the border edge reshapes the panels it slices.
         partitionPreserveFrames(layer, () => {
-          const next = stretchEdge(borderSquare, partitionEdge!, world.x - partitionEdgeStart.x, world.y - partitionEdgeStart.y);
+          const next = stretchEdge(
+            borderSquare,
+            partitionEdge!,
+            world.x - partitionEdgeStart.x,
+            world.y - partitionEdgeStart.y,
+          );
           if (next.corners && layer.borders[partitionEdgeBorder])
             layer.borders[partitionEdgeBorder] = next.corners.map((p) => ({ x: p.x, y: p.y }));
         });
@@ -2035,14 +2517,88 @@ export function useCanvasInteractions({
     };
 
     const onPointerUp = (e: PointerEvent) => {
-      // Layers tool: end any edge/cut/corner drag (or pan) cleanly. (Borders arrive via the cube placement,
+      // A Space-pan is pure navigation — it must not fall into the selection, arming, or
+      // Layers-tool click handling below, so a Space-click leaves the drawing exactly as
+      // it found it. Only the pan's own arming reset (matching every other gesture) stays.
+      if (mode === 'pan') {
+        mode = 'none';
+        partitionCellCandidate = null;
+        edgeClickArmed = false;
+        wallDimsArmedRef.current = false;
+        try {
+          el.releasePointerCapture(e.pointerId);
+        } catch {
+          // already released; ignore.
+        }
+        updateHoverCursor(e);
+        return;
+      }
+
+      // Layers tool: end any edge/cut/corner drag cleanly. (Borders arrive via the cube placement,
       // not a drag-to-draw, so there is no in-progress boundary draw to commit here.)
       if (layersActiveRef?.current) {
-        // Shift-marquee that began outside the border → add every panel group it swept to the selection.
+        // Commit an edge-plus duplicate: drop `count` copies of the shape stepping away from the grabbed
+        // side, each carrying its own lattice and panels. The last copy becomes the selection, so a chain
+        // of clicks walks a row outward the way it does in Plan mode.
+        if (mode === 'partitionPlus' && partitionPlus && partitionDocRef?.current) {
+          const { border, stepX, stepY, count } = partitionPlus;
+          const layer = partitionActiveLayer(partitionDocRef.current);
+          let last: number | null = null;
+          for (let i = 1; i <= count; i++) {
+            const copy = partitionDuplicateBorder(layer, border, stepX * i, stepY * i);
+            if (copy != null) last = copy;
+          }
+          if (last != null && partitionBorderSelRef) {
+            partitionBorderSelRef.current = new Set([last]);
+            partitionMutated = true;
+          }
+          partitionPlus = null;
+          if (partitionPlusRef) partitionPlusRef.current = null;
+          mode = 'none';
+          if (partitionMutated) {
+            commitHistory();
+            partitionMutated = false;
+          }
+          try {
+            el.releasePointerCapture(e.pointerId);
+          } catch {
+            // already released; ignore.
+          }
+          requestDraw('scene');
+          updateHoverCursor(e);
+          return;
+        }
+        // End of a paint stroke. The selection was already built live during the drag, so there is nothing
+        // to compute here — just bring the panel bar up over what was painted. A press that never moved
+        // isn't a stroke at all: it falls through to the click handling below, which picks the whole
+        // material group instead (paint = "these exact panels", click = "every panel like this one").
+        if (mode === 'partitionPaint') {
+          const strokePainted = draggedSinceDown && painted.size > 0;
+          paintBase = null;
+          painted = new Set();
+          paintLast = null;
+          mode = 'none';
+          if (strokePainted && partitionDocRef?.current && partitionCellSelRef) {
+            const layer = partitionActiveLayer(partitionDocRef.current);
+            syncCellMenuToSelection(layer, partitionCellSelRef.current);
+            partitionCellCandidate = null; // a real stroke — don't also run the click's group-select
+                try {
+              el.releasePointerCapture(e.pointerId);
+            } catch {
+              // already released; ignore.
+            }
+            requestDraw('scene');
+            updateHoverCursor(e);
+            return;
+          }
+        }
+        // Marquee that began outside the border → add every panel group it swept to the selection. (A plain
+        // sweep cleared the selection on pointer-down, so it reads as a replace; Shift keeps it and extends.)
         if (mode === 'partitionMarquee') {
           const m = marqueeRef.current;
           marqueeRef.current = null;
-          if (m && partitionGroupSelRef && partitionDocRef?.current) {
+          // As with rooms, only a real sweep selects — a no-drag click just clears (done on down).
+          if (m && draggedSinceDown && partitionCellSelRef && partitionDocRef?.current) {
             const layer = partitionActiveLayer(partitionDocRef.current);
             const a = screenToWorld(m.x0, m.y0, cameraRef.current);
             const b = screenToWorld(m.x1, m.y1, cameraRef.current);
@@ -2052,9 +2608,15 @@ export function useCanvasInteractions({
               w: Math.abs(a.x - b.x),
               h: Math.abs(a.y - b.y),
             };
-            const next = new Set(partitionGroupSelRef.current);
-            for (const k of partitionGroupKeysInRect(layer, rect)) next.add(k);
-            partitionGroupSelRef.current = next;
+            // Cell keys, not group keys: the sweep takes the panels it actually covered and leaves their
+            // identical twins elsewhere on the facade alone — the same "only what's in the box" rule a
+            // Plan-mode marquee follows.
+            const next = new Set(partitionCellSelRef.current);
+            for (const k of partitionCellKeysInRect(layer, rect)) next.add(k);
+            partitionCellSelRef.current = next;
+            // A sweep is a selection like any other, so it brings the bar with it — anchored under the
+            // bottom centre of everything it caught.
+            syncCellMenuToSelection(layer, next);
           }
           mode = 'none';
           try {
@@ -2081,7 +2643,7 @@ export function useCanvasInteractions({
                 : differencePartitionBorders(layer, bh.target, bh.other);
             if (ok) {
               partitionBorderSelRef.current = new Set();
-              if (partitionGroupSelRef) partitionGroupSelRef.current = new Set(); // group keys shift after reshaping
+              if (partitionCellSelRef) partitionCellSelRef.current = new Set(); // cells move after reshaping
               commitHistory();
             }
             partitionMoveBorder = null;
@@ -2110,44 +2672,76 @@ export function useCanvasInteractions({
         ) {
           const layer = partitionActiveLayer(partitionDocRef.current);
           const { sx, sy } = localPoint(e);
-          const clicked = partitionCellGroupAt(layer, screenToWorld(sx, sy, cameraRef.current));
+          // `keys` are CELL keys now, so compare against the cell under the cursor.
+          const clicked = partitionCellKeyAt(layer, screenToWorld(sx, sy, cameraRef.current));
           if (clicked == null || !frameEditRef?.current?.keys.includes(clicked)) {
             onExitFrameEdit?.();
           }
         }
-        // A clean LEFT-click on a panel (no drag) selects its whole material GROUP: plain replaces, Shift
-        // toggles; a clean click on empty space clears. A right-click (button ≠ 0) must NOT touch the
-        // selection, so the highlight stays visible while the right-click popup is open. (Render-only.)
+        // A clean LEFT-click on a panel (no drag) selects THAT panel; Shift-click takes every panel of the
+        // same type. A clean click on empty space clears. (Render-only — the selection is not history.)
         if (
           e.button === 0 &&
-          partitionGroupSelRef &&
+          partitionCellSelRef &&
           !draggedSinceDown &&
           !wasEditing && // during (or ending) an Edit session, the click doesn't change the selection
           partitionDocRef?.current
         ) {
           const layer = partitionActiveLayer(partitionDocRef.current);
-          const set = partitionGroupSelRef.current;
+          const set = partitionCellSelRef.current;
           if (partitionCellCandidate) {
-            const key = partitionCellGroupAt(layer, {
-              x: partitionCellCandidate.x,
-              y: partitionCellCandidate.y,
-            });
+            // A plain click takes exactly the ONE panel under the cursor. Identical panels are everywhere
+            // on a facade, so taking the whole material group lit up the elevation and made it impossible
+            // to act on a single unit.
+            //
+            // SHIFT-click is the deliberate "select similar": it takes every panel sharing this one's
+            // shape — the material-ID group — so a whole type can still be Assigned or Edited in one go.
+            // That is the only gesture that reaches for the group; everything else speaks in single cells.
+            const pt = { x: partitionCellCandidate.x, y: partitionCellCandidate.y };
+            const key = partitionCellKeyAt(layer, pt);
             if (key) {
               if (partitionCellCandidate.shift) {
-                if (set.has(key)) set.delete(key);
-                else set.add(key);
+                const grp = partitionCellGroupAt(layer, pt);
+                const twins = grp ? partitionGroupCellKeys(layer, grp) : [key];
+                // Toggle the type as a unit: drop it when it's already fully selected, else take all of it.
+                if (twins.every((c) => set.has(c))) for (const c of twins) set.delete(c);
+                else for (const c of twins) set.add(c);
               } else {
-                partitionGroupSelRef.current = new Set([key]);
+                partitionCellSelRef.current = new Set([key]);
+              }
+              // ...and brings the floating menu with it. Selecting IS how the bar opens — there is no
+              // right-click and no second gesture. The panel just clicked stays the Split/Edit target as
+              // long as it's still selected; a Shift-click that toggled it back OFF hands that role to
+              // what's left (and closes the bar once nothing is).
+              const sel = partitionCellSelRef.current;
+              if (sel.has(key)) {
+                openCellMenu(layer, {
+                  x: partitionCellCandidate.x,
+                  y: partitionCellCandidate.y,
+                });
+              } else {
+                syncCellMenuToSelection(layer, sel);
               }
             }
           } else if (!e.shiftKey && set.size) {
-            partitionGroupSelRef.current = new Set();
+            partitionCellSelRef.current = new Set();
           }
+          // A click that landed on no panel dismisses the bar, like any popover.
+          if (!partitionCellCandidate) onCellMenu?.(null);
         }
         partitionCellCandidate = null;
         // One undo step per gesture that actually changed the partition (draw, deform, line/segment move,
-        // duplicate). Pans and no-op clicks leave it untouched.
-        if (partitionMutated) commitHistory();
+        // duplicate). Selections and no-op clicks leave it untouched.
+        if (partitionMutated) {
+          commitHistory();
+          // Panels are selected by POSITION, so any gesture that moves or resizes the lattice leaves those
+          // keys pointing at cells that no longer exist. Drop the selection outright rather than let the
+          // highlight quietly evaporate on some panels and not others.
+          if (partitionCellSelRef?.current.size) {
+            partitionCellSelRef.current = new Set();
+            onCellMenu?.(null); // the bar is the selection's — it goes with it
+          }
+        }
         partitionMutated = false;
         partitionCorner = null;
         partitionMoveBorder = null;
@@ -2368,7 +2962,24 @@ export function useCanvasInteractions({
 
       if (mode === 'marquee') {
         const m = marqueeRef.current;
-        if (m) selectFromMarquee(m, cameraRef.current);
+        // Only a real sweep selects. A click with no drag leaves a zero-area marquee, and
+        // sweeping with it would bbox-hit whatever the click just missed (the corner of a
+        // rotated room) instead of reading as the deselect the user meant.
+        if (m && draggedSinceDown) selectFromMarquee(m, cameraRef.current);
+        else if (m && e.button === 0 && e.shiftKey) {
+          // A SHIFT-click that never travelled is not a sweep at all — it is the additive pick, and the
+          // only way to build the multi-selection every boolean needs ("click one room, Shift-click the
+          // other, then click their overlap"). It has to be a point hit-test, not a zero-area marquee:
+          // the marquee compares bounding boxes, so on a rotated or L-shaped room it would take one the
+          // click visibly missed. Clicking a room already in the selection drops it back out.
+          const { sx, sy } = localPoint(e);
+          const picked = hitTopShape(shapesRef.current, screenToWorld(sx, sy, cameraRef.current));
+          if (picked) {
+            const next = new Set(selectionRef.current);
+            if (!next.delete(picked.id)) next.add(picked.id);
+            selectionRef.current = next;
+          }
+        }
         marqueeRef.current = null;
         activeEdgeRef.current = null; // a marquee selects infills (move target)
         requestDraw('scene');
@@ -2455,10 +3066,31 @@ export function useCanvasInteractions({
     // while a multi-selection is active — vertex editing is a single-shape gesture, so
     // a double-click on a group of selected rooms shouldn't arm it.
     const onDoubleClick = (e: MouseEvent) => {
-      if (selectionRef.current.size > 1) return;
       const sx = e.clientX - rect.left;
       const sy = e.clientY - rect.top;
       const world = screenToWorld(sx, sy, cameraRef.current);
+      // Layers tool: double-click STEPS INTO a shape. Until then a border is an object you select and drag
+      // around; from here on the pointer edits its contents — mullions, splits, and paint-selecting panels —
+      // and the floating panel bar opens on the panel that was double-clicked. This is the boundary that
+      // keeps "move the shape" and "select its cells" from competing for the same plain drag.
+      if (layersActiveRef?.current && partitionDocRef?.current) {
+        const layer = partitionActiveLayer(partitionDocRef.current);
+        if (!partitionHasBoundary(layer)) return;
+        const bi = partitionBorderIndexAt(layer, world);
+        if (bi == null) return;
+        if (partitionEnteredRef) partitionEnteredRef.current = bi;
+        if (partitionBorderSelRef) partitionBorderSelRef.current = new Set([bi]);
+        // Land on the ONE panel under the cursor, so the bar opens on exactly what was double-clicked
+        // rather than lighting up every panel that shares its shape.
+        const cellKey = partitionCellKeyAt(layer, world);
+        if (partitionCellSelRef) {
+          partitionCellSelRef.current = cellKey ? new Set([cellKey]) : new Set();
+        }
+        openCellMenu(layer, world);
+        requestDraw('scene');
+        return;
+      }
+      if (selectionRef.current.size > 1) return;
       const hit = hitTopShape(shapesRef.current, world);
       if (hit) {
         hit.dots = !hit.dots;
@@ -2467,43 +3099,52 @@ export function useCanvasInteractions({
       }
     };
 
-    // Layers tool: right-click a cell → open the split menu for that cell (cols × rows). Default canvas
-    // context menu is suppressed only while the tool is active and a boundary exists.
-    const onContextMenu = (e: MouseEvent) => {
-      if (!layersActiveRef?.current) return;
-      const doc = partitionDocRef?.current;
-      const layer = doc ? partitionActiveLayer(doc) : null;
-      if (!layer || !partitionHasBoundary(layer)) return;
-      const sx = e.clientX - rect.left;
-      const sy = e.clientY - rect.top;
-      const world = screenToWorld(sx, sy, cameraRef.current);
-      const ref = hitPartitionCell(layer, world);
-      if (!ref) return; // right-clicked outside every border → fall through to the default menu
-      // Right-clicking a cell SELECTS its group (so Edit/Assign target it) and opens the split menu. Works in
-      // both Border and Panels mode so panels can be created right after placing a border with the cube.
-      const grpKey = partitionCellGroupAt(layer, world);
-      if (grpKey && partitionGroupSelRef) partitionGroupSelRef.current = new Set([grpKey]);
-      e.preventDefault();
-      onCellContextMenu?.({ screenX: e.clientX, screenY: e.clientY, ref, rect: partitionCellRefRect(layer, ref) });
-      requestDraw('scene'); // reflect the new selection highlight under the popup
-    };
-
     // Escape cancels an armed placement or the armed/in-progress footprint tool.
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
+      // Step back out to shape level: the border stays selected (and draggable), its panels do not.
+      if (partitionEnteredRef?.current != null) {
+        partitionEnteredRef.current = null;
+        if (partitionCellSelRef) partitionCellSelRef.current = new Set();
+        onCellMenu?.(null);
+        requestDraw('scene');
+      }
       if (placementRef.current) {
         placementRef.current = null;
         alignGuidesRef.current = null; // drop placement snap guides
-        setCursor('grab');
+        setCursor('default');
         requestDraw('scene');
       }
       if (footprintArmRef.current || footprintDraftRef.current) {
         footprintArmRef.current = false;
         footprintDraftRef.current = null;
         mode = 'none';
-        setCursor('grab');
+        setCursor('default');
         requestDraw('scene');
       }
+    };
+
+    // Hold Space to pan: while it's down the pointer drags the camera and nothing
+    // else, and releasing it hands the canvas straight back to selection/editing.
+    // Ignored while a field (or a focusable control) has focus so typing a space —
+    // or activating a button with it — still works.
+    const onSpaceDown = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || e.repeat || isKeyboardTarget(e.target)) return;
+      e.preventDefault(); // Space would otherwise scroll the page
+      if (spaceHeld) return;
+      spaceHeld = true;
+      if (mode === 'none') setCursor('grab');
+    };
+    const onSpaceUp = (e: KeyboardEvent) => {
+      if (e.code !== 'Space') return;
+      spaceHeld = false;
+      // A pan in flight keeps 'grabbing' until pointer-up; otherwise the next
+      // pointer-move restores the hover cursor from here.
+      if (mode !== 'pan') setCursor('default');
+    };
+    // Alt-tabbing away eats the keyup, which would otherwise leave Space "stuck" down.
+    const onBlurClearSpace = () => {
+      spaceHeld = false;
     };
 
     // Shift pressed/released while hovering an armed edge face toggles the
@@ -2517,16 +3158,18 @@ export function useCanvasInteractions({
       }
     };
 
-    setCursor('grab');
+    setCursor('default');
     el.addEventListener('pointerdown', onPointerDown);
     el.addEventListener('pointermove', onPointerMove);
     el.addEventListener('pointerup', onPointerUp);
     el.addEventListener('pointercancel', onPointerUp);
     el.addEventListener('dblclick', onDoubleClick);
-    el.addEventListener('contextmenu', onContextMenu);
     window.addEventListener('resize', refreshRect);
     window.addEventListener('scroll', refreshRect, true);
     window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keydown', onSpaceDown);
+    window.addEventListener('keyup', onSpaceUp);
+    window.addEventListener('blur', onBlurClearSpace);
     window.addEventListener('keydown', onShiftToggle);
     window.addEventListener('keyup', onShiftToggle);
 
@@ -2536,10 +3179,12 @@ export function useCanvasInteractions({
       el.removeEventListener('pointerup', onPointerUp);
       el.removeEventListener('pointercancel', onPointerUp);
       el.removeEventListener('dblclick', onDoubleClick);
-      el.removeEventListener('contextmenu', onContextMenu);
       window.removeEventListener('resize', refreshRect);
       window.removeEventListener('scroll', refreshRect, true);
       window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keydown', onSpaceDown);
+      window.removeEventListener('keyup', onSpaceUp);
+      window.removeEventListener('blur', onBlurClearSpace);
       window.removeEventListener('keydown', onShiftToggle);
       window.removeEventListener('keyup', onShiftToggle);
     };
@@ -2567,7 +3212,7 @@ export function useCanvasInteractions({
     onHoverRoomKey,
     clearFindHighlight,
     alignGuidesRef,
-    onCellContextMenu,
+    onCellMenu,
     onExitFrameEdit,
   ]);
 }

@@ -127,7 +127,14 @@ export function LibraryPanel({
       id: cluster.id,
       shapes: cluster.shapes,
     };
-    e.currentTarget.setPointerCapture(e.pointerId);
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // No such active pointer — the case for a synthesized gesture (the guided tour drags a card out
+      // onto the canvas). Capture is an optimisation here, not the mechanism: the move/up handlers work
+      // off coordinates, so losing it costs nothing, whereas letting it throw would abort the gesture on
+      // its first event.
+    }
   };
 
   const onPointerMove = (e: PointerEvent<HTMLDivElement>) => {
@@ -206,6 +213,7 @@ export function LibraryPanel({
             else itemRefs.current.delete(cluster.id);
           }}
           className={`${styles.item}${dragId === cluster.id ? ` ${styles.dragging}` : ''}`}
+          data-demo={`library-item-${i}`}
           onPointerDown={(e) => onPointerDown(e, cluster)}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}

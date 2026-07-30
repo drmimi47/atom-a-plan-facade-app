@@ -7,8 +7,14 @@ import {
   saveLibrary,
 } from './library';
 import constraintsFile from './constraints_file.txt?raw';
-import { type Constraints, EMPTY_CONSTRAINTS } from '../backend/types';
-import { parseConstraints } from '../backend/parseConstraints';
+import facadeConstraintsFile from './facade_constraints_file.txt?raw';
+import {
+  type Constraints,
+  type FacadeConstraints,
+  EMPTY_CONSTRAINTS,
+  EMPTY_FACADE_CONSTRAINTS,
+} from '../backend/types';
+import { parseConstraints, parseFacadeConstraints } from '../backend/parseConstraints';
 import { parsePrompt } from '../backend/parsePrompt';
 import { resolveRoomList } from './rooms/roomCatalog';
 import { isFindQuery } from './search/findQuery';
@@ -20,24 +26,38 @@ import {
 } from './components/InfiniteCanvas/InfiniteCanvas';
 import { ActionButton } from './components/ActionButton/ActionButton';
 import { NavBar } from './components/NavBar/NavBar';
-import { DebugToggle } from './components/DebugToggle/DebugToggle';
 import { StatsBar } from './components/StatsBar/StatsBar';
-import { FpsMeter } from './components/FpsMeter/FpsMeter';
 import { AdjacencyMatrix } from './components/AdjacencyMatrix/AdjacencyMatrix';
-import { TopBar, type Mode } from './components/TopBar/TopBar';
+import { TopBar, type Mode, type TopBarHandle } from './components/TopBar/TopBar';
 import { TopRightBar } from './components/TopRightBar/TopRightBar';
 import { RenderPanel, type RenderState } from './components/RenderPanel/RenderPanel';
 import { AssemblyInspector } from './components/AssemblyInspector/AssemblyInspector';
 import { FacadePanel } from './components/FacadePanel/FacadePanel';
 import { CellSplitMenu } from './components/CellSplitMenu/CellSplitMenu';
+import { DemoOverlay } from './components/DemoOverlay/DemoOverlay';
+import type { DemoContext } from './demo/demoScript';
 import {
   newDoc,
   summarizeDoc,
   type CellRef,
+  type FacadeMetrics,
   type FacadeSummary,
   type OptimizeStrategy,
+  type PanelMode,
+  type PanelKind,
   type Rect,
 } from './facade/partition';
+
+/** Facade readouts before a border exists — also the fallback when the canvas isn't mounted yet. */
+const EMPTY_FACADE_METRICS: FacadeMetrics = {
+  panels: 0,
+  types: 0,
+  standardizationPct: 0,
+  areaSqft: 0,
+  wwrPct: 0,
+  uValue: 0,
+  cost: 0,
+};
 import { renderFacadeSelection } from './facade/render';
 import type { AssemblyMetadata } from './facade/metadata';
 import {
@@ -48,12 +68,16 @@ import {
   bandInchesFor,
   withBandInches,
 } from './facade/catalog';
-import type { PanelType } from './facade/standardize';
 import { LoginModal } from './components/LoginModal/LoginModal';
 import { useAuth } from './auth/useAuth';
 import { firebaseEnabled } from './auth/firebase';
 import { signOutUser } from './auth/auth';
-import { loadUserData, saveUserConstraints, saveUserAdjacency } from './auth/userData';
+import {
+  loadUserData,
+  saveUserConstraints,
+  saveUserFacadeConstraints,
+  saveUserAdjacency,
+} from './auth/userData';
 import { applyAdjacency, DEFAULT_ADJACENCY } from './rooms/roomAdjacency';
 import { useWindowSize } from './hooks/useWindowSize';
 import { DEFAULT_GRID_SIZE } from './constants';
@@ -72,21 +96,28 @@ export default function App() {
   // Constraints: the textbox content (seeded from constraints_file.txt) and the
   // structured rules parsed from it. Parsing is debounced and runs off the main
   // thread of typing, so the LLM is hit at most once after the user pauses.
+  //
+  // There are TWO independent rule sets, one per editor mode, kept side by side rather than merged: a
+  // floorplan is judged on room areas and wall thicknesses, a facade on panel sizes, glazing ratio, and
+  // cost. Each is edited, parsed, persisted, and enforced on its own; the Constraints box shows whichever
+  // belongs to the current mode, and the canvas enforces only that one.
   const [constraintsText, setConstraintsText] = useState(constraintsFile);
   const [constraints, setConstraints] = useState<Constraints>(EMPTY_CONSTRAINTS);
+  const [facadeConstraintsText, setFacadeConstraintsText] = useState(facadeConstraintsFile);
+  const [facadeConstraints, setFacadeConstraints] =
+    useState<FacadeConstraints>(EMPTY_FACADE_CONSTRAINTS);
 
-  // Debug overlays (green centre numbers + cyan overlap) — off until toggled.
-  const [debug, setDebug] = useState(false);
-  // Dev-only Adjacency Matrix window (prediction-rank editor) — opened from the dev cluster.
+  // Adjacency Matrix window (room-prediction rank editor) — opened from the Generate submenu. It tunes
+  // what Generate reaches for next, so it is no longer behind the Dev toggle.
   const [matrixOpen, setMatrixOpen] = useState(false);
   // Catalog key of the room the cursor is over, used to highlight its row/column in the
   // matrix. Only tracked while the matrix is open (gated below) to avoid re-renders otherwise.
   const [hoverRoomKey, setHoverRoomKey] = useState<string | null>(null);
   const matrixHoverGate = useRef(false);
   useEffect(() => {
-    matrixHoverGate.current = debug && matrixOpen;
+    matrixHoverGate.current = matrixOpen;
     if (!matrixHoverGate.current) setHoverRoomKey(null);
-  }, [debug, matrixOpen]);
+  }, [matrixOpen]);
   const handleHoverRoomKey = useCallback((key: string | null) => {
     if (!matrixHoverGate.current) return;
     setHoverRoomKey((prev) => (prev === key ? prev : key));
@@ -97,10 +128,34 @@ export default function App() {
   const { user, authResolved } = useAuth();
   const [guest, setGuest] = useState(false);
 
-  // Export the current plan. Placeholder for now — the actual export (image/PDF/JSON)
-  // will be wired here.
-  const handleExport = useCallback(() => {
-    // TODO: implement plan export.
+  // Guided demo: null when not running. The overlay owns which mode and which step; App only owns the
+  // switch and the context object the script drives the app through.
+  const [demoOpen, setDemoOpen] = useState(false);
+  // Nav popups are owned by the NavBar, so the script asks for one via a bumped sequence number.
+  const [panelRequest, setPanelRequest] = useState<{
+    panel: 'constraints' | 'prompt' | 'library' | null;
+    seq: number;
+  } | null>(null);
+  const panelSeq = useRef(0);
+  // ...and reports back which one ended up open, however it was opened (the tour presses the real nav
+  // buttons as often as it asks). Stepping BACK in the tour restores the view a step ended on, and the
+  // open panel is part of that view. A ref, not state: nothing here re-renders on it.
+  const openPanelRef = useRef<'constraints' | 'prompt' | 'library' | null>(null);
+  const handlePanelChange = useCallback((panel: 'constraints' | 'prompt' | 'library' | null) => {
+    openPanelRef.current = panel;
+  }, []);
+  // The title bar, so pressing Demo can bank whatever is on the canvas before the tour takes it over.
+  const topBarRef = useRef<TopBarHandle>(null);
+  /**
+   * Start the guided tour on an empty canvas — but never at the cost of the user's drawing.
+   *
+   * The tour drives the REAL canvas and builds from nothing, so it cannot run over existing geometry.
+   * Banking first means the work is filed in the Saved list under its current title and is one click away
+   * again as soon as the tour is over, instead of being silently thrown out by pressing Demo.
+   */
+  const handleDemo = useCallback(() => {
+    topBarRef.current?.stashToSaved();
+    setDemoOpen(true);
   }, []);
 
   // Saved Library clusters (persisted to localStorage). The Library button's screen
@@ -178,13 +233,13 @@ export default function App() {
   // bottom cube (ActionButton) can switch to its Facade look when Facade is active.
   const [editorMode, setEditorMode] = useState<Mode>('Plan');
 
-  // Analyze view (nav toggle): in Plan mode it ghosts every shape on the canvas (same look as Dev
-  // mode); in Facade mode the Analyze button instead opens the standardization popup (no ghosting).
-  const [analyze, setAnalyze] = useState(false);
-  // Facade standardization: whether the Analyze popup is open (turns on the canvas's panel-type
-  // colouring + type-group click-select), and the live list of standardized panel types it reports.
-  const [analyzeOpen, setAnalyzeOpen] = useState(false);
-  const [panelTypes, setPanelTypes] = useState<PanelType[]>([]);
+  // Analyze (nav toggle): shows/hides the live statistics along the bottom of the screen. On by
+  // default in both modes — the readouts are the point, and the button is there to get them out of
+  // the way. The same button does the same thing in both modes.
+  const [statsVisible, setStatsVisible] = useState(true);
+  // Facade mode's six readouts (area, WWR, U-value, panels, types, cost), re-read from the canvas
+  // whenever the partition changes while they're on screen.
+  const [facadeStats, setFacadeStats] = useState<FacadeMetrics>(EMPTY_FACADE_METRICS);
 
   // Facade-mode AI render: the idle/in-flight/finished render, plus the live selected-shape count
   // (gates the panel's Render button). Triggered by the NavBar Render button.
@@ -203,68 +258,112 @@ export default function App() {
   // Facade Layers tool (uniform sticky-cell partition): whether it's active, the live layer/cell summary
   // reported by the canvas (drives the top-center navigator), and the right-click cell-split popover.
   const [layersActive, setLayersActive] = useState(false);
-  // Layers tool sub-mode: Border (edit the trim boundary) vs Panels (border locked, edit the inner grid).
-  // The tool launches in Border mode so the user draws/shapes the boundary first.
-  const [borderMode, setBorderMode] = useState(true);
+  // Whether the tool was on when we last left Facade mode, so returning restores it (see the effect below).
+  const layersOnLeavingFacadeRef = useRef(false);
+  // Mirror of the live flag, so that effect can read it while running ONLY on a mode change.
+  const layersActiveLiveRef = useRef(layersActive);
+  layersActiveLiveRef.current = layersActive;
   // Material-ID (segmentation) view toggle for the Layers tool.
   const [idView, setIdView] = useState(false);
   // Purely-visual drop shadow under the per-group frame bands (depth only). Off by default.
   const [frameShadow, setFrameShadow] = useState(false);
-  // Optimize (panel rationalization) popup: open state, the selected strategy, and the live panel metric
-  // (total visible panels + how many are unique shapes) queried from the canvas when the popup is open.
+  // Paint-by-number panel overlay (the "Panel Numbers" view switch).
   const [optimizeOpen, setOptimizeOpen] = useState(false);
-  const [optimizeStrategy, setOptimizeStrategy] = useState<OptimizeStrategy>('edge-normalize');
-  const [panelStats, setPanelStats] = useState<{ total: number; unique: number }>({ total: 0, unique: 0 });
   // Edit-a-panel session: true while zoomed into a selected group editing its per-edge frame.
   const [editingFrame, setEditingFrame] = useState(false);
   const [facadeNav, setFacadeNav] = useState<FacadeSummary>(() => summarizeDoc(newDoc()));
+  // The open panel menu: which cell Split/Edit act on, plus its live screen anchor. The anchor is republished
+  // by the canvas on every scene draw from the CURRENT panel selection, so the bar sits under the bottom
+  // centre of what's selected and follows it as it's dragged, panned, or zoomed.
   const [splitMenu, setSplitMenu] = useState<{
-    x: number;
-    y: number;
+    /** Null until the canvas publishes the first anchor — the bar stays unmounted rather than
+     *  flashing at a placeholder position for one frame. */
+    x: number | null;
+    y: number | null;
     ref: CellRef;
     rect: Rect | null;
+    /** Whether the shape has been split yet — the panel actions only exist once it has panels. */
+    subdivided: boolean;
+    /** The shape's rationalization mode, ticked in the Optimize menu. */
+    mode: PanelMode | null;
   } | null>(null);
   // Live faint preview of the pending split (cell ref + counts), shown on the canvas before Apply. The canvas
   // renders it from the actual resulting partition so it spans the whole boundary and clips like real panels.
   const [splitPreview, setSplitPreview] = useState<{ ref: CellRef; cols: number; rows: number } | null>(
     null,
   );
+  // Hovered Assign option — the selected panels render in that material until the pointer leaves or the
+  // option is clicked. Render-only; nothing reaches the document until then.
+  const [kindPreview, setKindPreview] = useState<{ kind: PanelKind | null } | null>(null);
+  // Hovered Optimize option — that shape renders as the strategy would leave it, uncommitted.
+  const [optimizePreview, setOptimizePreview] = useState<{
+    border: number;
+    strategy: OptimizeStrategy;
+  } | null>(null);
 
-  // Stable so the canvas's pointer-listener effect doesn't re-subscribe on every App render.
-  const handleCellContextMenu = useCallback(
-    (info: { screenX: number; screenY: number; ref: CellRef; rect: Rect | null }) =>
-      setSplitMenu({ x: info.screenX, y: info.screenY, ref: info.ref, rect: info.rect }),
+  // Stable so the canvas's pointer-listener effect doesn't re-subscribe on every App render. Opens with no
+  // anchor yet; the canvas publishes the real one on the draw this triggers, and the bar mounts then.
+  const handleCellMenu = useCallback(
+    (info: { ref: CellRef; rect: Rect | null; subdivided: boolean; mode: PanelMode | null } | null) => {
+      if (!info) {
+        setSplitMenu(null);
+        setSplitPreview(null);
+        return;
+      }
+      setSplitMenu({
+        x: null,
+        y: null,
+        ref: info.ref,
+        rect: info.rect,
+        subdivided: info.subdivided,
+        mode: info.mode,
+      });
+    },
     [],
   );
+
+  // Live anchor from the canvas. A null anchor means the selection is gone (its border was deleted) — close.
+  const handleCellMenuAnchor = useCallback((anchor: { x: number; y: number } | null) => {
+    setSplitMenu((prev) => {
+      if (!prev) return prev;
+      if (!anchor) return null;
+      if (prev.x === anchor.x && prev.y === anchor.y) return prev; // no move → no re-render
+      return { ...prev, x: anchor.x, y: anchor.y };
+    });
+  }, []);
 
   // Close the split menu and drop its preview together.
   const closeSplitMenu = useCallback(() => {
     setSplitMenu(null);
     setSplitPreview(null);
+    setKindPreview(null);
+    setOptimizePreview(null);
   }, []);
 
-  // Pull the live panel metric (total + unique-shape count) from the canvas.
-  const refreshPanelStats = useCallback(() => {
-    setPanelStats(canvasHandle.current?.partitionPanelStats() ?? { total: 0, unique: 0 });
+  // Pull the live facade readouts (drives the bottom statistics in Facade mode).
+  const refreshFacadeStats = useCallback(() => {
+    setFacadeStats(canvasHandle.current?.facadeMetrics() ?? EMPTY_FACADE_METRICS);
   }, []);
 
-  // Open/close the Optimize popup; refresh the panel metric on open so it's current.
-  const toggleOptimize = useCallback(() => {
-    setOptimizeOpen((open) => {
-      if (!open) refreshPanelStats();
-      return !open;
-    });
-  }, [refreshPanelStats]);
+  // Toggle the paint-by-number panel overlay. It used to also expand the Optimize section; that section is
+  // always on show now, so this is purely a view switch.
+  const toggleOptimize = useCallback(() => setOptimizeOpen((open) => !open), []);
 
-  // Apply the selected rationalization strategy (undoable) and re-read the metric to reflect the result.
-  const applyOptimize = useCallback(() => {
-    canvasHandle.current?.optimizePartition(optimizeStrategy);
-    refreshPanelStats();
-  }, [optimizeStrategy, refreshPanelStats]);
+  // Rationalize the shape the panel bar belongs to (undoable), then re-read the unique-panel metric. The
+  // bar closes with the selection the strategy invalidates, so the preview is cleared alongside it.
+  const applyOptimize = useCallback(
+    (strategy: OptimizeStrategy) => {
+      const border = splitMenu?.ref.border;
+      if (border == null) return;
+      setOptimizePreview(null);
+      canvasHandle.current?.optimizePartition(border, strategy);
+    },
+    [splitMenu],
+  );
 
-  // Edit-a-panel: start the session from the right-click menu's Edit (zoom + auto-frame the selected group).
+  // Edit-a-panel: start the session from the floating menu's Edit (zoom + auto-frame the selected group).
   const startFrameEdit = useCallback(() => {
-    // Zoom to the panel that was right-clicked to open this menu, not the group's top-left cell.
+    // Zoom to the panel that was clicked to open this menu, not the group's top-left cell.
     const res = canvasHandle.current?.startPanelFrameEdit(splitMenu?.rect ?? null);
     if (res) setEditingFrame(true);
     closeSplitMenu();
@@ -276,9 +375,16 @@ export default function App() {
     setEditingFrame(false);
   }, []);
 
-  // The Layers tool is Facade-only; turn it off whenever we leave Facade mode.
+  // The Layers tool is Facade-only, so it switches off on the way out of Facade mode — and back ON when we
+  // return. Without the restore the partition (every border and panel drawn in Facade) simply isn't drawn on
+  // re-entry, so the facade reads as EMPTY until the next cube gesture re-arms the tool and it all reappears.
   useEffect(() => {
-    if (editorMode !== 'Facade') setLayersActive(false);
+    if (editorMode === 'Facade') {
+      if (layersOnLeavingFacadeRef.current) setLayersActive(true);
+      return;
+    }
+    layersOnLeavingFacadeRef.current = layersActiveLiveRef.current;
+    setLayersActive(false);
   }, [editorMode]);
 
   // Close the Optimize popup whenever the Layers tool is off (also covers leaving Facade mode).
@@ -299,11 +405,12 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [editingFrame, endFrameEdit]);
 
-  // Keep the metric live while the popup is open — facadeNav changes when the partition does (cell splits,
-  // border edits), so re-read the unique-shape count on each of those updates.
+  // Same for the bottom statistics: re-read the facade readouts on every partition change while they're
+  // showing. Material assignments don't move geometry (so `facadeNav` is unchanged) — that path refreshes
+  // them directly where the assignment is made.
   useEffect(() => {
-    if (optimizeOpen) refreshPanelStats();
-  }, [optimizeOpen, facadeNav, refreshPanelStats]);
+    if (statsVisible && editorMode === 'Facade') refreshFacadeStats();
+  }, [statsVisible, editorMode, facadeNav, refreshFacadeStats]);
 
   // Edit a type-level (non-band) metadata field — applies to the whole assembly type.
   const handleAssemblyFieldChange = useCallback(
@@ -421,9 +528,26 @@ export default function App() {
     }
   }, []);
 
+  // The facade twin: its own text, its own parser, its own rule object. Never merged with the plan set.
+  const applyFacadeConstraintsText = useCallback(async (text: string) => {
+    setFacadeConstraintsText(text);
+    setConstraintsBusy(true);
+    try {
+      setFacadeConstraints(await parseFacadeConstraints(text));
+    } finally {
+      setConstraintsBusy(false);
+    }
+  }, []);
+
   // A user-initiated Save (from the Constraints editor / Reset defaults): apply, then —
-  // when signed in — persist the text to the user's account.
+  // when signed in — persist the text to the user's account. Routed by the CURRENT mode, so the box
+  // always edits the rule set it is showing.
   const handleConstraintsSave = async (text: string) => {
+    if (editorMode === 'Facade') {
+      await applyFacadeConstraintsText(text);
+      if (user) void saveUserFacadeConstraints(user.uid, text);
+      return;
+    }
     await applyConstraintsText(text);
     if (user) void saveUserConstraints(user.uid, text);
   };
@@ -469,16 +593,20 @@ export default function App() {
     totalAreaExceeded: false,
     grossAreaExceeded: false,
     roomCountExceeded: false,
+    facadeGlobalExceeded: false,
     violatedKeys: [],
   });
 
   useEffect(() => {
-    // Parse the seeded constraints once on mount (the regex fallback in
+    // Parse BOTH seeded rule sets once on mount (the regex fallback in
     // parseConstraints covers the no-API-key case). Every later change comes
     // through Save → handleConstraintsSave, which parses and applies explicitly.
     let cancelled = false;
     parseConstraints(constraintsText).then((next) => {
       if (!cancelled) setConstraints(next);
+    });
+    parseFacadeConstraints(facadeConstraintsText).then((next) => {
+      if (!cancelled) setFacadeConstraints(next);
     });
     return () => {
       cancelled = true;
@@ -499,14 +627,55 @@ export default function App() {
       void loadUserData(uid).then((data) => {
         if (!data) return;
         if (typeof data.constraintsText === 'string') void applyConstraintsText(data.constraintsText);
+        if (typeof data.facadeConstraintsText === 'string') {
+          void applyFacadeConstraintsText(data.facadeConstraintsText);
+        }
         if (data.adjacency) applyAdjacency(data.adjacency);
       });
     } else if (!uid && prevUidRef.current) {
       prevUidRef.current = null;
       void applyConstraintsText(constraintsFile);
+      void applyFacadeConstraintsText(facadeConstraintsFile);
       applyAdjacency(JSON.parse(JSON.stringify(DEFAULT_ADJACENCY)));
     }
-  }, [user, authResolved, applyConstraintsText]);
+  }, [user, authResolved, applyConstraintsText, applyFacadeConstraintsText]);
+
+  // What the guided demo is allowed to touch — the real handle and the real setters, never a mock, so the
+  // tour cannot drift from the product. `scene` carries the world rect a step built forward to later steps.
+  const demoScene = useRef<{ rect: Rect | null; stage: number }>({ rect: null, stage: 0 });
+  // Live mirror of the editor mode — a running demo step reads this rather than its snapshot.
+  const editorModeRef = useRef(editorMode);
+  editorModeRef.current = editorMode;
+  const demoCtx: Omit<DemoContext, 'ui'> = {
+    canvas: canvasHandle.current,
+    getMode: () => editorModeRef.current,
+    // World → viewport, so the tour's cursor can point at what the canvas is doing.
+    toScreen: (w) => canvasHandle.current?.worldToClient(w) ?? { x: 0, y: 0 },
+    setMode: setEditorMode,
+    setLayersActive,
+    setIdView,
+    setPanelNumbers: setOptimizeOpen,
+    setFrameShadow,
+    setStatsVisible,
+    setConstraintHighlights: setConstraintHighlightsOn,
+    openPanel: (panel) => {
+      panelSeq.current += 1;
+      setPanelRequest({ panel, seq: panelSeq.current });
+    },
+    // Everything the tour's own switches can change, read live — what a step ends on is what stepping back
+    // to it has to put back.
+    getView: () => ({
+      mode: editorModeRef.current,
+      layers: layersActiveLiveRef.current,
+      idView,
+      panelNumbers: optimizeOpen,
+      frameShadow,
+      stats: statsVisible,
+      highlights: constraintHighlightsOn,
+      panel: openPanelRef.current,
+    }),
+    scene: demoScene.current,
+  };
 
   // Esc clears an active smart-find highlight (and its chip).
   useEffect(() => {
@@ -537,26 +706,24 @@ export default function App() {
         ref={canvasHandle}
         gridSize={DEFAULT_GRID_SIZE}
         constraints={constraints}
-        debug={debug}
-        // Analyze ghosts the canvas in Plan mode only; in Facade it opens an empty popup
-        // (handled in the NavBar) instead of ghosting.
-        analyze={analyze && editorMode === 'Plan'}
+        facadeConstraints={facadeConstraints}
         facade={editorMode === 'Facade'}
         showConstraintHighlights={constraintHighlightsOn}
         onStatsChange={setStats}
         onSelectionChange={setSelectionCount}
         onSelectedPanelChange={setSelectedPanel}
         layersActive={layersActive && editorMode === 'Facade'}
-        borderMode={borderMode}
         idView={idView}
         frameShadow={frameShadow}
         panelNumbers={optimizeOpen || idView}
         splitPreview={splitPreview}
+        kindPreview={kindPreview}
+        optimizePreview={optimizePreview}
         onPartitionChange={setFacadeNav}
-        onCellContextMenu={handleCellContextMenu}
+        onCellMenu={handleCellMenu}
+        menuCell={splitMenu?.ref ?? null}
+        onCellMenuAnchorChange={handleCellMenuAnchor}
         onExitFrameEdit={endFrameEdit}
-        standardize={analyzeOpen && editorMode === 'Facade'}
-        onPanelTypesChange={setPanelTypes}
         libraryDropRef={libraryButtonRectRef}
         libraryPopupDropRef={libraryPopupRectRef}
         onLibraryHover={setLibraryDragOver}
@@ -564,39 +731,29 @@ export default function App() {
         onFindChange={setFindCount}
         onHoverRoomKey={handleHoverRoomKey}
       />
-      <TopBar mode={editorMode} onModeChange={setEditorMode} />
-      {/* Facade Layers tool: right-docked control panel (Border / Panels, Material-ID, Optimize settings). */}
+      <TopBar
+        ref={topBarRef}
+        mode={editorMode}
+        onModeChange={setEditorMode}
+        canvasRef={canvasHandle}
+      />
+      {/* Facade Layers tool: right-docked control panel (view switches + Optimize settings). */}
       {editorMode === 'Facade' && layersActive && (
         <FacadePanel
-          layerCount={facadeNav.layerCount}
-          activeIndex={facadeNav.activeIndex}
-          drawing={facadeNav.drawing}
-          borderMode={borderMode}
           idView={idView}
           frameShadow={frameShadow}
           optimizeActive={optimizeOpen}
-          total={panelStats.total}
-          unique={panelStats.unique}
-          strategy={optimizeStrategy}
-          borderSelCount={facadeNav.borderSelCount}
-          borderSelCanBoolean={facadeNav.borderSelCanBoolean}
-          onSelectBorder={() => setBorderMode(true)}
-          onSelectLayer={(i) => {
-            setBorderMode(false); // switching to a Panels tab locks the border
-            canvasHandle.current?.selectLayer(i);
-          }}
           onToggleIdView={() => setIdView((v) => !v)}
           onToggleFrameShadow={() => setFrameShadow((v) => !v)}
           onToggleOptimize={toggleOptimize}
-          onSelectStrategy={setOptimizeStrategy}
-          onApply={applyOptimize}
         />
       )}
-      {/* Facade Layers tool: right-click cell-split popover. */}
-      {editorMode === 'Facade' && layersActive && splitMenu && (
+      {/* Facade Layers tool: the floating panel menu, bottom-centred under the selected panel(s). */}
+      {editorMode === 'Facade' && layersActive && splitMenu && splitMenu.x != null && splitMenu.y != null && (
         <CellSplitMenu
           x={splitMenu.x}
           y={splitMenu.y}
+          canEditPanels={splitMenu.subdivided}
           onChange={(cols, rows) =>
             setSplitPreview(splitMenu.rect ? { ref: splitMenu.ref, cols, rows } : null)
           }
@@ -606,20 +763,33 @@ export default function App() {
           }}
           onClose={closeSplitMenu}
           onEdit={startFrameEdit}
+          onPreviewKind={setKindPreview}
+          panelMode={splitMenu.mode}
+          onOptimize={applyOptimize}
+          onPreviewStrategy={(strategy) =>
+            setOptimizePreview(strategy ? { border: splitMenu.ref.border, strategy } : null)
+          }
           onAssignKind={(kind) => {
             canvasHandle.current?.assignPanelKind(kind);
+            // A material swap changes WWR / U-value / cost without moving any geometry, so the
+            // partition-change effect above won't fire — re-read the readouts here.
+            refreshFacadeStats();
             closeSplitMenu();
           }}
         />
       )}
-      {/* Global budget breach (Max Total Area, Max Total Gross Area, or Max Room
-          Count): wash the canvas the constraint yellow until enough rooms are deleted
-          to get back under budget. Sits at z-index 1 — between the grid (0) and the
+      {/* Global budget breach — in Plan mode Max Total Area / Max Total Gross Area / Max Room Count, in
+          Facade mode a whole-elevation rule (WWR, U-value, standardization, counts, cost). Either way the
+          rule describes the drawing as a whole rather than one unit, so it washes the canvas the constraint
+          yellow until the design is back in range. Sits at z-index 1 — between the grid (0) and the
           scene/shape layer (2) — so it reads as a background BEHIND the rooms, leaving
           per-room flags (edges, infills) visible on top. Non-interactive so it never
           blocks canvas gestures. */}
       {constraintHighlightsOn &&
-        (stats.totalAreaExceeded || stats.grossAreaExceeded || stats.roomCountExceeded) && (
+        (stats.totalAreaExceeded ||
+          stats.grossAreaExceeded ||
+          stats.roomCountExceeded ||
+          stats.facadeGlobalExceeded) && (
         <div
           aria-hidden
           style={{
@@ -631,23 +801,33 @@ export default function App() {
           }}
         />
       )}
+      {/* The Constraints box edits whichever rule set belongs to the current mode — same editor, two
+          bodies of rules. `constraintsScope` also tells it which parser to map lines to keys with, so the
+          violated-line highlighting stays correct on both. */}
       <NavBar
-        constraintsText={constraintsText}
+        constraintsScope={editorMode}
+        constraintsText={editorMode === 'Facade' ? facadeConstraintsText : constraintsText}
         onConstraintsTextChange={handleConstraintsSave}
-        defaultConstraintsText={constraintsFile}
+        defaultConstraintsText={editorMode === 'Facade' ? facadeConstraintsFile : constraintsFile}
         constraintsBusy={constraintsBusy}
         violatedConstraintKeys={stats.violatedKeys}
         constraintHighlightsVisible={constraintHighlightsOn}
         onToggleConstraintHighlights={() => setConstraintHighlightsOn((v) => !v)}
-        analyzeActive={analyze}
-        onToggleAnalyze={() => setAnalyze((v) => !v)}
-        onAnalyzeOpenChange={setAnalyzeOpen}
-        panelTypes={panelTypes}
-        onSelectPanelType={(ids) => canvasHandle.current?.selectShapeIds(ids)}
-        facadeActive={editorMode === 'Facade'}
-        onRender={handleRender}
+        analyzeActive={statsVisible}
+        onToggleAnalyze={() => setStatsVisible((v) => !v)}
         onPanelOpenChange={handlePanelOpenChange}
+        requestPanel={panelRequest}
+        onPanelChange={handlePanelChange}
+        matrixOpen={matrixOpen}
+        onToggleMatrix={() =>
+          setMatrixOpen((open) => {
+            if (!open) setRender(null); // one top-right card at a time
+            return !open;
+          })
+        }
         onFix={startFix}
+        // The guided auto-fix wand reshapes ROOMS, so it has nothing to act on in Facade mode.
+        fixSupported={editorMode !== 'Facade'}
         findMatchCount={findCount}
         onBoundsChange={setNavBounds}
         onPromptSubmit={handlePromptSubmit}
@@ -669,14 +849,13 @@ export default function App() {
         <ActionButton
           canvasRef={canvasHandle}
           facade={editorMode === 'Facade'}
-          onArmFacadeBorder={() => {
-            setLayersActive(true);
-            setBorderMode(true); // arm border placement in the trim-editing sub-mode
-          }}
+          onArmFacadeBorder={() => setLayersActive(true)}
         />
       </NavBar>
       <StatsBar
-        visible={stats.roomCount > 0}
+        visible={statsVisible}
+        facade={editorMode === 'Facade'}
+        facadeMetrics={facadeStats}
         roomCount={stats.roomCount}
         roomCountExceeded={stats.roomCountExceeded}
         totalAreaSqft={stats.totalAreaSqft}
@@ -686,36 +865,8 @@ export default function App() {
         usableAreaSqft={stats.usableAreaSqft}
         navBounds={navBounds}
         viewportWidth={width}
-        rightAddon={
-          debug ? (
-            <>
-              <button
-                type="button"
-                onClick={() => setMatrixOpen((o) => !o)}
-                title="Open the prediction adjacency matrix"
-                style={{
-                  border: 'none',
-                  borderRadius: 8,
-                  padding: '5px 10px',
-                  font: 'inherit',
-                  // Match the FPS·ms readout's type (12px / 500 / #a1a1aa).
-                  fontSize: 12,
-                  fontWeight: 500,
-                  cursor: 'pointer',
-                  color: matrixOpen ? '#ffffff' : '#a1a1aa',
-                  background: matrixOpen ? '#6ea8fe' : 'rgba(15, 23, 42, 0.06)',
-                }}
-              >
-                Matrix
-              </button>
-              <FpsMeter />
-            </>
-          ) : undefined
-        }
-      >
-        <DebugToggle on={debug} onChange={setDebug} />
-      </StatsBar>
-      {debug && matrixOpen && (
+      />
+      {matrixOpen && (
         <AdjacencyMatrix
           key={user?.uid ?? 'guest'}
           onClose={() => setMatrixOpen(false)}
@@ -723,11 +874,11 @@ export default function App() {
           hoveredKey={hoverRoomKey}
         />
       )}
-      {/* Top-right action cluster (Export + sign-out). Always on screen — including over the
+      {/* Top-right action cluster (Demo + sign-out). Always on screen — including over the
           login modal — so it doesn't pop in after sign-in / continue-as-guest. Sign-out signs a
           real user out or ends a guest session (a harmless no-op on the login screen itself). */}
       <TopRightBar
-        onExport={handleExport}
+        onDemo={handleDemo}
         email={user?.email}
         onSignOut={() => {
           void signOutUser();
@@ -756,11 +907,11 @@ export default function App() {
         <RenderPanel
           state={render}
           selectionCount={selectionCount}
-          debug={debug}
           onRender={handleRender}
           onClose={() => setRender(null)}
         />
       )}
+      {demoOpen && <DemoOverlay ctx={demoCtx} onExit={() => setDemoOpen(false)} />}
       {authResolved && !user && !guest && (
         <LoginModal enabled={firebaseEnabled} onGuest={() => setGuest(true)} />
       )}

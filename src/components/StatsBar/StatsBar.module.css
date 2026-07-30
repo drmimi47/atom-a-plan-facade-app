@@ -1,29 +1,3 @@
-/* Dev cluster — pinned to the bottom-left corner. The Debug toggle sits level with the
-   bottom-centre nav pill and shares the top-left settings icon's 16px left inset; its tools
-   (FPS/ms, Matrix, and future additions) stack UPWARD above it so they never run off the
-   bottom of the screen. Anchoring the toggle keeps it from shifting when the tools show/hide. */
-.debug {
-  position: fixed;
-  left: 16px;
-  bottom: 40px; /* the 26px toggle centred on the nav pill's ~53px centreline */
-  z-index: 20;
-
-  display: flex;
-  flex-direction: column-reverse; /* toggle at the bottom, tools stacking above it */
-  align-items: flex-start;
-  gap: 8px;
-  user-select: none;
-}
-
-/* Left-justified column of dev tools shown above the Debug toggle (Debug on):
-   the Matrix button on top, the FPS·ms readout below, with breathing room between. */
-.devTools {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 8px;
-}
-
 /* A stat group, centred (via inline `left`) on the open space beside the central
    menu. The `bottom` value is the nav pill's centreline (pill: bottom 24px, ~58px
    tall → centre ≈ 53px), and translateY(50%) anchors the group by its own vertical

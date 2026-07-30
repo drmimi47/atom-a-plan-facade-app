@@ -1,6 +1,13 @@
 import type { Camera, LengthUnit } from '../types';
 import { worldToScreen, type Vec2 } from './coords';
-import { drawBoxDimensions } from './shapes';
+import {
+  drawBoxDimensions,
+  drawCornerRotationArcs,
+  drawPlusCircle,
+  edgePlusAnchorsScreen,
+  polygonShape,
+  EDGE_PLUS_RADIUS,
+} from './shapes';
 import { SHAPE_THEME, BORDER_DIM_GAP } from '../constants';
 import {
   borderPolygons,
@@ -10,9 +17,12 @@ import {
   cellRects,
   cellGroups,
   cellIdColors,
+  cellKey,
+  borderMode,
+  optimizeBorder,
   cellNumbers,
-  groupFrame,
-  groupPanelKind,
+  panelFrameAt,
+  panelKindAt,
   panelFrameBand,
   panelBorderEdges,
   segmentEndpoints,
@@ -23,6 +33,7 @@ import {
   type FacadeLayer,
   type GroupFrame,
   type PanelKind,
+  type OptimizeStrategy,
   type Rect,
   type SegmentRef,
 } from '../facade/partition';
@@ -109,11 +120,10 @@ const CELL_STROKE = '#334155'; // dark slate — the active layer's cell outline
 const CELL_FILL = '#ffffff'; // plain white infill on the active layer (no tint)
 const GHOST_STROKE = 'rgba(15, 23, 42, 0.22)'; // trace-paper outline for layers beneath the active one
 const SEG_HIGHLIGHT = '#db2777'; // magenta — the shift-selected line segment
-const SELECTED_BORDER = '#f59e0b'; // amber — a border picked for a boolean (unite/difference) op
 const BOOL_OVERLAP_FILL = 'rgba(0, 200, 220, 0.20)'; // cyan tint marking the shared interior of two picked borders
 const BOOL_CUE_LINE = '#6ea8fe'; // accent blue for the union "+" grid / subtract hatch (matches the Plan-mode cues)
 const BOOL_TRIM_EDGE = '#ef4444'; // red — the border that a subtract will trim (loses the overlap)
-const TRIM_FILL = '#94a3b8'; // slate — the single Edge-Profile perimeter trim band (one consistent profile)
+const TRIM_FILL = '#ffffff'; // white — the Edge-Profile perimeter trim reads as part of the frame assembly
 const FRAME_FILL = '#ffffff'; // white infill (matches CELL_FILL) — the per-group (Edit-a-panel) inset frame band
 const FRAME_STROKE = CELL_STROKE; // match the panel cell outlines (the lines shown before a frame) — elevation mullion
 const FRAME_STROKE_WIDTH = 1; // match the vertical/horizontal grid-line weight
@@ -129,6 +139,11 @@ const SELECTED_OVERLAY = 'rgba(120, 120, 120, 0.5)';
 // Material-ID view uses a much darker grey so the selection clearly stands out, while staying
 // translucent enough that the underlying segmentation hue remains readable beneath it.
 const SELECTED_OVERLAY_ID = 'rgba(30, 30, 30, 0.62)';
+// Constraint-violation flag on a panel — the same warning yellow a flagged room wears in Plan mode
+// (VIOLATION_YELLOW in shapes.ts), as a translucent wash plus a solid outline so it survives any fill
+// beneath it (material pattern, Material-ID hue, selection grey).
+const FLAG_OVERLAY = 'rgba(250, 204, 21, 0.42)';
+const FLAG_STROKE = '#facc15';
 
 // --- Assigned panel-material fill patterns (the right-click "Assign" kinds) ---
 const VISION_LINE = '#7fa3d6'; // crisp blue 45° glass slashes for clear vision glass
@@ -152,28 +167,63 @@ export function drawPartition(
   camera: Camera,
   opts: {
     selectedSegment?: SegmentRef | null;
-    /** Group keys of the selected panels — drawn black (ID view) / white (normal view). */
-    selectedGroups?: Set<string>;
+    /** Cell keys of the selected panels — drawn black (ID view) / white (normal view). Per-PANEL, not per
+     *  material group, so a rubber-band sweep highlights only the panels it covered. */
+    selectedCells?: Set<string>;
+    /**
+     * Cell keys of the panels breaking a Facade-mode constraint (too wide, too tall, too small…). Washed
+     * and outlined in the same warning yellow a flagged room gets in Plan mode, so one visual language
+     * covers both. Undefined (or empty) when no rule is broken or the Visibility eye is off.
+     */
+    flaggedCells?: Set<string>;
+    /**
+     * Live "what would this look like" preview while hovering an option in the Assign menu: the SELECTED
+     * panels render with this material instead of their own. Render-only — nothing is written to the
+     * document until the option is clicked, so moving off the menu simply restores what was there.
+     * `{ kind: null }` previews clearing the assignment; the whole field is null when not previewing.
+     */
+    kindPreview?: { kind: PanelKind | null } | null;
     /** Material-ID view: paint each cell its flat segmentation colour and drop all chrome. */
     idView?: boolean;
-    /** Border mode: the trim border is editable — draw its draggable corner handles. In Panels mode the
-     *  border is locked, so the handles are hidden (the outline still shows). */
-    borderMode?: boolean;
-    /** Indices of borders picked for a boolean (unite/difference) op — highlighted in the selection colour. */
+    /**
+     * Clicked border indices. Every selected border shows its draggable corner handles; exactly one also
+     * shows its dimensions (like a single-selected room); two are armed for a boolean (unite/difference)
+     * op. The outline colour never changes. This is what replaced the Border/Panels edit switch — border
+     * geometry is editable whenever its border is selected, with no mode to toggle.
+     */
     selectedBorders?: Set<number>;
+    /**
+     * The border the user has double-clicked INTO, or null. It gets a heavier outline so "I am editing this
+     * shape's contents" is legible at a glance — outside it a border is an object you drag, inside it the
+     * pointer paints panels, and the two are otherwise indistinguishable on screen.
+     */
+    enteredBorder?: number | null;
+    /**
+     * Live Optimize-menu preview: run `strategy` on `border` against a throwaway CLONE of the active layer
+     * and draw that. Running the real `optimizeBorder` — rather than re-deriving what it would do — is what
+     * lets the one-shot Snap to Grid preview too (the outline moves onto the lattice and the cells re-cut),
+     * and guarantees the preview can never drift from what clicking actually commits, toggle-off included.
+     */
+    optimizePreview?: { border: number; strategy: OptimizeStrategy } | null;
+    /**
+     * Live edge-plus drag: how many adjacent copies of `border` to ghost, stepped by (dx, dy) each. Mirrors
+     * the Plan-mode duplicate preview — drag outward from a plus button and the row grows under the cursor.
+     */
+    plusPreview?: { border: number; dx: number; dy: number; count: number } | null;
     /** Live Plan-style boolean classification of the cursor over two picked, overlapping borders: drives the
      *  union "+" grid (shared interior) / subtract hatch (bounding edge) preview. */
     boolHover?: BorderBooleanHover | null;
-    /** Active length unit — when set (and in Border mode) each border shows live, editable width/height dims. */
+    /** Active length unit — when set (and in Border mode) the selected border shows live, editable dims. */
     unit?: LengthUnit;
     /** Optimize overlay: paint each panel its shape-GROUP number, centred (identical panels share a number). */
     showPanelNumbers?: boolean;
     /**
-     * Edit-a-panel session: outline the representative cell + magenta-highlight the draggable frame face(s) —
-     * just `hoverSide`, or all four when `all` (editing every side at once).
+     * Edit-a-panel session: outline EVERY selected cell + magenta-highlight the draggable frame face(s) on
+     * each — just `hoverSide`, or all four when `all` (editing every side at once).
      */
     frameEdit?: {
-      rect: Rect;
+      /** EVERY selected panel — each one is a grabbable handle that drives the whole selection. */
+      rects: Rect[];
       frame: GroupFrame;
       hoverSide: 'n' | 'e' | 's' | 'w' | 'b' | null;
       all: boolean;
@@ -221,23 +271,28 @@ export function drawPartition(
     }
   };
 
-  // Stroke the clean sliced outline of every border, then (in Border mode) its draggable corner dots. Borders
-  // picked for a boolean op are stroked in the amber selection colour (slightly heavier) so they read as armed.
+  // Stroke the clean sliced outline of every border, then (in Border mode) its draggable corner dots. Every
+  // border keeps the one accent blue whether or not it's picked — like a Plan-mode room, selection reads from
+  // the dimensions that appear, not from a colour change.
+  /**
+   * Outline every border, and put draggable corner dots on the ones in `handlesFor`. Handles follow the
+   * SELECTION rather than an edit mode: clicking a border reveals its vertices, which is what makes the
+   * old Border/Panels switch unnecessary. Pass null for none (ghost layers).
+   */
   const strokeBorderOutlines = (
     layer: FacadeLayer,
     stroke: string,
     width: number,
-    handles: boolean,
-    selected?: Set<number>,
+    handlesFor: Set<number> | null,
   ) => {
     borderPolygons(layer).forEach((poly, bi) => {
-      const sel = selected?.has(bi) ?? false;
-      const col = sel ? SELECTED_BORDER : stroke;
       tracePoly(poly);
-      ctx.strokeStyle = col;
-      ctx.lineWidth = sel ? width + 1.5 : width;
+      ctx.strokeStyle = stroke;
+      // The entered shape reads heavier — the one cue that the pointer is editing its contents. Only the
+      // active layer can be entered, and it is the only caller that passes a handle set.
+      ctx.lineWidth = handlesFor && opts.enteredBorder === bi ? width + 2 : width;
       ctx.stroke();
-      if (!handles) return;
+      if (!handlesFor?.has(bi)) return;
       for (const c of poly) {
         const p = worldToScreen(c.x, c.y, camera);
         ctx.beginPath();
@@ -245,23 +300,75 @@ export function drawPartition(
         ctx.fillStyle = '#ffffff';
         ctx.fill();
         ctx.lineWidth = 2;
-        ctx.strokeStyle = col;
+        ctx.strokeStyle = stroke;
         ctx.stroke();
       }
     });
   };
 
-  // Live width/height dimension brackets around every border's bounding box (Border mode only), in the trim
-  // accent — the same CAD geometry rooms/footprints use, so they read identically and stay editable. Drawn
-  // UNCLIPPED (the brackets hang outside the border).
+  // Live width/height dimension brackets around the SELECTED border's bounding box (Border mode only), in the
+  // trim accent — the same CAD geometry rooms/footprints use, so they read identically and stay editable. Drawn
+  // UNCLIPPED (the brackets hang outside the border). Gated exactly like a Plan-mode room's: they appear on the
+  // one border a click selects, and only when it's alone in the selection, so an unclicked facade stays clean.
+  /**
+   * The four edge-midpoint "+" buttons around the single-selected border — the Plan-mode duplicate
+   * affordance, in the facade accent instead of the room theme. Click one to drop a copy of the whole
+   * shape (outline, lattice and panels) against that side; drag outward to run a row of them, previewed
+   * as ghost outlines. Shown only at shape level: once the user is inside a shape they are editing its
+   * panels, and a button hovering off its edge would just be in the way.
+   */
+  const drawEdgePlusButtons = (layer: FacadeLayer) => {
+    const sel = opts.selectedBorders;
+    if (!sel || sel.size !== 1) return;
+    const bi = [...sel][0];
+    if (bi === opts.enteredBorder) return;
+    const poly = borderPolygons(layer)[bi];
+    if (!poly || poly.length < 3) return;
+
+    // Rotation affordance: the same corner arcs a selected room wears in Plan mode, at half the dimension
+    // gap so they sit between the outline and the dimension spines.
+    ctx.save();
+    ctx.strokeStyle = ACCENT;
+    ctx.lineWidth = 2;
+    drawCornerRotationArcs(
+      ctx,
+      poly.map((p) => worldToScreen(p.x, p.y, camera)),
+      BORDER_DIM_GAP / 2,
+    );
+    ctx.restore();
+
+    // Ghost the pending copies first, so the buttons sit on top of them.
+    const preview = opts.plusPreview;
+    if (preview && preview.border === bi && preview.count > 0) {
+      ctx.save();
+      ctx.strokeStyle = ACCENT;
+      ctx.globalAlpha = 0.45;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 4]);
+      for (let i = 1; i <= preview.count; i++) {
+        tracePoly(poly.map((p) => ({ x: p.x + preview.dx * i, y: p.y + preview.dy * i })));
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    for (const p of edgePlusAnchorsScreen(polygonShape(poly), camera)) {
+      drawPlusCircle(ctx, Math.round(p.x), Math.round(p.y), EDGE_PLUS_RADIUS, ACCENT, '#ffffff');
+    }
+  };
+
   const drawBorderDimensions = (layer: FacadeLayer) => {
-    if (!opts.unit) return;
+    const unit = opts.unit;
+    if (!unit) return;
+    const sel = opts.selectedBorders;
+    if (!sel || sel.size !== 1) return;
     const scale = camera.scale;
-    for (const poly of borderPolygons(layer)) {
+    borderPolygons(layer).forEach((poly, bi) => {
+      if (!sel.has(bi)) return;
       const bb = polyBBox(poly);
       const wS = bb.w * scale;
       const hS = bb.h * scale;
-      if (Math.min(wS, hS) <= BORDER_DIM_MIN_PX) continue;
+      if (Math.min(wS, hS) <= BORDER_DIM_MIN_PX) return;
       const c = worldToScreen(bb.x + bb.w / 2, bb.y + bb.h / 2, camera);
       const hw = wS / 2;
       const hh = hS / 2;
@@ -286,9 +393,9 @@ export function drawPartition(
       ctx.translate(Math.round(c.x), Math.round(c.y));
       // Smaller gap than rooms (no wall band) → the dimensions hug the border's actual edges. For a
       // deformed/irregular border the dims (and the outline box) fall back to the bounding box.
-      drawBoxDimensions(ctx, corners, corners, bb.w, bb.h, 0, opts.unit, BORDER_DIM_THEME, !isRect, BORDER_DIM_GAP);
+      drawBoxDimensions(ctx, corners, corners, bb.w, bb.h, 0, unit, BORDER_DIM_THEME, !isRect, BORDER_DIM_GAP);
       ctx.restore();
-    }
+    });
   };
 
   // Draw an assigned panel material's fill PATTERN inside a cell's screen rect (already clipped to the border
@@ -372,28 +479,81 @@ export function drawPartition(
     ctx.restore();
   };
 
-  // Edge-Profile mode: fill the whole border region with the single trim colour as an underlay. The whole
+  /** The outlines of the borders currently in Edge-Profile mode — the only ones that carry a trim band. */
+  const trimBorders = (layer: FacadeLayer): Vec2[][] =>
+    borderPolygons(layer).filter((p, b) => p.length >= 3 && borderMode(layer, b) === 'edge-profile');
+
+  /** Trace a set of polygons as ONE path (multiple subpaths), for a combined fill/stroke. */
+  const tracePolys = (polys: Vec2[][]) => {
+    ctx.beginPath();
+    for (const poly of polys) {
+      if (poly.length < 2) continue;
+      const p0 = worldToScreen(poly[0].x, poly[0].y, camera);
+      ctx.moveTo(p0.x, p0.y);
+      for (let i = 1; i < poly.length; i++) {
+        const p = worldToScreen(poly[i].x, poly[i].y, camera);
+        ctx.lineTo(p.x, p.y);
+      }
+      ctx.closePath();
+    }
+  };
+
+  // Edge-Profile mode: fill each such border's region with the single trim colour as an underlay. The whole
   // rectangular panels (only cells fully inside the border) then paint on top, leaving the sliced perimeter
   // showing through as one consistent trim band. Caller must already have clipped to the border.
   const fillTrim = (layer: FacadeLayer) => {
-    if (!layer.edgeProfile) return;
-    traceAllBorders(layer);
+    const polys = trimBorders(layer);
+    if (!polys.length) return;
+    tracePolys(polys);
     ctx.fillStyle = TRIM_FILL;
     ctx.fill();
+  };
+
+  /**
+   * Re-assert the Edge-Profile trim on top of the frame shadow pass, then outline it like a mullion.
+   *
+   * The trim sits at the SAME height as the frames, so nothing at that height can cast onto it — a shadow
+   * running across the trim would read as the trim being recessed behind the mullions it abuts. Drawing the
+   * ring last is what occludes those shadows, exactly as the real coplanar profile would. Shadows still fall
+   * where they should: on the recessed glass, and on the wall outside the border.
+   *
+   * The ring is the border minus the whole panels, punched with even-odd. In Edge-Profile mode `cellRects`
+   * returns only the cells that fit entirely inside the boundary, so what's left over IS the trim band.
+   */
+  const paintTrimRing = (layer: FacadeLayer) => {
+    const polys = trimBorders(layer);
+    if (!polys.length) return;
+    ctx.save();
+    tracePolys(polys); // begins the path with the trim-mode border outlines
+    for (const rect of cellRects(layer)) {
+      const [x, y, w, h] = screenRect(rect);
+      ctx.rect(x, y, w, h);
+    }
+    ctx.fillStyle = TRIM_FILL;
+    ctx.fill('evenodd');
+    tracePolys(polys);
+    ctx.strokeStyle = FRAME_STROKE;
+    ctx.lineWidth = FRAME_STROKE_WIDTH;
+    ctx.stroke();
+    ctx.restore();
   };
 
   // Per-group frames (Edit-a-panel): an inset band along every edge of each cell whose group has an override,
   // plus the live Edit-session affordances (representative-cell outline + hovered-side magenta strip).
   const drawGroupFrames = (layer: FacadeLayer) => {
-    if (layer.frames && Object.keys(layer.frames).length) {
+    // The Edge-Profile trim belongs to the same white assembly as the frames, so it casts with them: its
+    // silhouette is the border outline, swept along the light and punched back out so only the crescent
+    // OUTSIDE the border survives — a drop shadow on the wall, never over the panels it surrounds.
+    const trimPolys = trimBorders(layer);
+    if ((layer.frames && Object.keys(layer.frames).length) || trimPolys.length) {
       ctx.save();
       // Each framed panel's band as (outer outline, inner glass) WORLD polygons. The band hugs every edge of
       // the panel's visible shape — including the trim-border cut — so border-sliced panels get a mullion that
       // runs along the (diagonal) border, and the band re-fits live as the border moves. `outer` is already
       // clipped to the border, so no extra canvas clip is needed.
       const bands: { outer: Vec2[]; glass: Vec2[] }[] = [];
-      for (const { rect, key } of cellGroups(layer)) {
-        const f = groupFrame(layer, key);
+      for (const { rect } of cellGroups(layer)) {
+        const f = panelFrameAt(layer, cellKey(rect));
         if (!f) continue;
         const band = panelFrameBand(layer, rect, f);
         if (band) bands.push(band);
@@ -420,7 +580,7 @@ export function drawPartition(
       // glass opening keeps its inner shadow: only the part that stays lit through the whole sweep,
       // `glass ∩ (glass+off)`, is punched back out — as a reverse-wound subpath so nonzero treats
       // it as a hole. The offset scales with zoom so the shadow stays glued to the frame.
-      if (opts.frameShadow) {
+      if (opts.frameShadow && (bands.length || trimPolys.length)) {
         ctx.save();
         ctx.fillStyle = FRAME_SHADOW;
         const off = 9 * camera.scale; // light direction, in screen px (equal x/y => 45° down-right)
@@ -432,6 +592,16 @@ export function drawPartition(
           ctx.closePath();
         };
         ctx.beginPath();
+        for (const poly of trimPolys) {
+          const outline = toScreen(poly);
+          if (outline.length < 3) continue;
+          const swept = convexHull([...outline, ...shift(outline)]);
+          traceScreen(swept);
+          // Punch the border itself back out, so the trim's shadow lands on the wall, not on the facade.
+          const hole =
+            signedArea(outline) > 0 === signedArea(swept) > 0 ? outline.slice().reverse() : outline;
+          traceScreen(hole);
+        }
         for (const b of bands) {
           const outer = toScreen(b.outer);
           if (outer.length < 3) continue;
@@ -472,14 +642,16 @@ export function drawPartition(
     }
 
     const fe = opts.frameEdit;
-    if (fe) {
-      const [rx, ry, rw, rh] = screenRect(fe.rect);
+    // Every panel in the Edit selection is a live handle: grabbing any one of their mullions drives the
+    // whole set, so all of them wear the affordance. Marking only one made the rest look like passengers.
+    for (const feRect of fe?.rects ?? []) {
+      const [rx, ry, rw, rh] = screenRect(feRect);
       // A panel that borders the trim (its visible shape is cut by the diagonal border) isn't really this
       // axis-aligned rectangle, so the dashed "original size" outline and the magenta wash both jut past the
       // border and read as wrong. Drop the dashed outline there, and clip the wash to the border polygon.
-      const borderCut = panelBorderEdges(layer, fe.rect).length > 0;
+      const borderCut = panelBorderEdges(layer, feRect).length > 0;
       ctx.save();
-      // Dashed outline of the representative panel being edited — only when it sits fully inside the border.
+      // Dashed outline of each panel being edited — only where it sits fully inside the border.
       if (!borderCut) {
         ctx.strokeStyle = ACCENT;
         ctx.lineWidth = 1.5;
@@ -489,18 +661,18 @@ export function drawPartition(
       }
       // Magenta wash over the draggable face(s): all four strips when editing all sides at once (Shift),
       // otherwise just the hovered axis-aligned side.
-      const litSides: ('n' | 'e' | 's' | 'w')[] = fe.all
+      const litSides: ('n' | 'e' | 's' | 'w')[] = fe!.all
         ? ['n', 'e', 's', 'w']
-        : fe.hoverSide && fe.hoverSide !== 'b'
-          ? [fe.hoverSide]
+        : fe!.hoverSide && fe!.hoverSide !== 'b'
+          ? [fe!.hoverSide]
           : [];
       if (litSides.length) {
         const sc = camera.scale;
-        const f = fe.frame;
+        const f = fe!.frame;
         ctx.save();
         // Clip the wash to the border so a border-sliced panel's strips don't bleed past the boundary.
         if (borderCut) {
-          const border = borderContaining(layer, fe.rect);
+          const border = borderContaining(layer, feRect);
           if (border.length >= 3) {
             ctx.beginPath();
             const p0 = worldToScreen(border[0].x, border[0].y, camera);
@@ -526,10 +698,10 @@ export function drawPartition(
       }
       // The diagonal border-cut frame edge(s): highlight every cut line so they read as draggable. Shown when
       // hovering the border frame, or when Shift previews scaling all edges (the border scales too).
-      if (fe.hoverSide === 'b' || fe.all) {
+      if (fe!.hoverSide === 'b' || fe!.all) {
         ctx.strokeStyle = 'rgba(219, 39, 119, 0.85)';
         ctx.lineWidth = 3;
-        for (const be of panelBorderEdges(layer, fe.rect)) {
+        for (const be of panelBorderEdges(layer, feRect)) {
           const a = worldToScreen(be[0].x, be[0].y, camera);
           const b2 = worldToScreen(be[1].x, be[1].y, camera);
           ctx.beginPath();
@@ -565,27 +737,41 @@ export function drawPartition(
   //     a clean paint-by-numbers map for masking (no inner grid lines/ghosts). In Border mode the editable
   //     boundary outline + corner dots are drawn on top so the user can still reshape it; Panels mode keeps
   //     the map handle-free.
-  const sel = opts.selectedGroups;
+  const sel = opts.selectedCells;
+  const flagged = opts.flaggedCells;
+  /** Wash + outline one panel as constraint-violating. Drawn last so it survives every fill beneath it. */
+  const drawFlag = (x: number, y: number, w: number, h: number) => {
+    ctx.fillStyle = FLAG_OVERLAY;
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = FLAG_STROKE;
+    ctx.lineWidth = 2.5;
+    ctx.strokeRect(x, y, w, h);
+  };
   const activeLayer = doc.layers[doc.activeIndex];
   if (opts.idView && activeLayer && hasBoundary(activeLayer)) {
     ctx.save();
     traceAllBorders(activeLayer);
-    if (!activeLayer.steppedEdge) ctx.clip(); // stepped mode draws whole cells unclipped (the stair-step)
+    // Always clip. Stepped mode used to draw unclipped so its half-outside cells could show whole; now
+    // every panel it keeps fits inside the border, so the clip is a guarantee rather than a restriction.
+    ctx.clip();
     fillTrim(activeLayer); // Edge-Profile: perimeter trim underlay (no-op otherwise)
-    for (const { rect, color, key } of cellIdColors(activeLayer)) {
+    for (const { rect, color } of cellIdColors(activeLayer)) {
       const [x, y, w, h] = screenRect(rect);
+      const k = cellKey(rect);
       ctx.fillStyle = color;
       ctx.fillRect(x, y, w, h);
-      if (sel?.has(key)) {
+      if (sel?.has(k)) {
         ctx.fillStyle = SELECTED_OVERLAY_ID; // darken the hue to mark selection, colour still readable
         ctx.fillRect(x, y, w, h);
       }
+      if (flagged?.has(k)) drawFlag(x, y, w, h);
     }
     ctx.restore();
-    // In Border mode the boundary stays editable even over the Material-ID map, so draw the blue outline
-    // and corner dots on top of the colours to signal that (Panels mode keeps the clean handle-free map).
-    if (opts.borderMode) strokeBorderOutlines(activeLayer, ACCENT, 2, true);
+    // The boundary stays editable over the Material-ID map too, so draw the blue outline on top of the
+    // colours — with corner dots on the selected border(s) only, keeping an unselected map handle-free.
     drawGroupFrames(activeLayer);
+    paintTrimRing(activeLayer); // after the frames: coplanar, so their shadows must not cross it
+    strokeBorderOutlines(activeLayer, ACCENT, 2, opts.selectedBorders ?? null);
     drawPanelNumbers(activeLayer);
     return;
   }
@@ -604,31 +790,45 @@ export function drawPartition(
     }
     ctx.restore();
     // The trim outline itself (clean sliced edge), per border. No corner handles on ghost layers.
-    strokeBorderOutlines(layer, GHOST_STROKE, 1, false);
+    strokeBorderOutlines(layer, GHOST_STROKE, 1, null);
   });
 
   // --- Active layer: clip the regular grid to the trim border, then draw the border + corner handles ---
-  const active = doc.layers[doc.activeIndex];
+  // A hovered Optimize option is applied to a CLONE first, so the panels below render as that strategy
+  // would leave them while the document itself is untouched until the option is clicked.
+  let active = doc.layers[doc.activeIndex];
+  const mp = opts.optimizePreview;
+  if (active && mp) {
+    const preview = JSON.parse(JSON.stringify(active)) as FacadeLayer;
+    optimizeBorder(preview, mp.border, mp.strategy);
+    active = preview;
+  }
   if (active && hasBoundary(active)) {
     ctx.save();
     traceAllBorders(active);
-    if (!active.steppedEdge) ctx.clip(); // stepped mode draws whole cells unclipped (the stair-step)
+    ctx.clip(); // every mode's panels now fit inside the border, so the clip only enforces that
     fillTrim(active); // Edge-Profile: perimeter trim underlay (no-op otherwise)
     // Inner cell outlines are only drawn once SOME border has actually been subdivided (a grid exists). Before
     // that the whole boundary is a single panel whose edge IS the blue border outline — stroking the fixed
     // root rect here would linger as a stray dark rectangle once the border is deformed off its drawn spot.
     const showCellOutlines = active.grids.some((g) => g != null);
-    // We need per-cell group KEYS when a panel group is selected OR any panel has an assigned material kind
-    // (both look up by key). Otherwise take the cheaper plain `cellRects` path (no clipping for keys).
+    // We need the per-cell walk when a panel is selected (cell keys) OR any panel has an assigned material
+    // kind (group keys). Otherwise take the cheaper plain `cellRects` path (no clipping for keys).
     const hasKinds = !!active.panelKinds && Object.keys(active.panelKinds).length > 0;
-    if ((sel && sel.size) || hasKinds) {
-      for (const { rect, key } of cellGroups(active)) {
+    // Constraint flags are keyed per cell, so they need the keyed walk too — not just selection/materials.
+    if ((sel && sel.size) || hasKinds || (flagged && flagged.size)) {
+      for (const { rect } of cellGroups(active)) {
         const [x, y, w, h] = screenRect(rect);
+        const k = cellKey(rect);
         ctx.fillStyle = CELL_FILL;
         ctx.fillRect(x, y, w, h);
-        const kind = hasKinds ? groupPanelKind(active, key) : null;
+        // A hovered Assign option overrides the assigned material on the selected panels only.
+        const preview = opts.kindPreview && sel?.has(k) ? opts.kindPreview : null;
+        const kind = preview ? preview.kind : hasKinds ? panelKindAt(active, k) : null;
         if (kind) drawPanelPattern(kind, x, y, w, h);
-        if (sel?.has(key)) {
+        // The selection grey is dropped on previewed panels: at half opacity it muddies the very material
+        // the user is trying to judge, and the previewed panels ARE the selection, so nothing is ambiguous.
+        if (sel?.has(k) && !preview) {
           ctx.fillStyle = SELECTED_OVERLAY; // white + grey overlay → a light grey selected panel
           ctx.fillRect(x, y, w, h);
         }
@@ -637,6 +837,7 @@ export function drawPartition(
           ctx.lineWidth = 1.25;
           ctx.strokeRect(x, y, w, h);
         }
+        if (flagged?.has(k)) drawFlag(x, y, w, h);
       }
     } else {
       for (const rect of cellRects(active)) {
@@ -690,7 +891,7 @@ export function drawPartition(
     // click target). Hovering it shows the UNION "+" grid; hovering an edge that bounds it shows the SUBTRACT
     // hatch over the region the trimmed border loses, plus a red dashed outline of that border. Mirrors the
     // Plan-mode room booleans — the in-canvas replacement for the old Combine buttons.
-    if (opts.borderMode && opts.selectedBorders && opts.selectedBorders.size === 2) {
+    if (opts.selectedBorders && opts.selectedBorders.size === 2) {
       const polys = borderPolygons(active);
       const idx = [...opts.selectedBorders].filter((i) => i >= 0 && i < polys.length);
       if (idx.length === 2) {
@@ -761,12 +962,15 @@ export function drawPartition(
       }
     }
 
-    // Trim border outline (the clean sliced boundary) for every border, plus corner handles in Border mode
-    // (hidden when the border is locked in Panels mode). Border-mode selection is highlighted for boolean ops.
-    strokeBorderOutlines(active, ACCENT, 2, !!opts.borderMode, opts.borderMode ? opts.selectedBorders : undefined);
-    // Live, editable width/height dimensions on each border — Border mode only.
-    if (opts.borderMode) drawBorderDimensions(active);
     drawGroupFrames(active);
+    paintTrimRing(active); // after the frames: coplanar, so their shadows must not cross it
+    // Chrome last, so the trim's white ring can't creep over the blue outline or the corner handles.
+    // Trim border outline (the clean sliced boundary) for every border, with corner handles on the
+    // selected one(s) — select a border and its vertices become draggable, no edit mode required.
+    strokeBorderOutlines(active, ACCENT, 2, opts.selectedBorders ?? null);
+    // Live, editable width/height dimensions on the single-selected border.
+    drawBorderDimensions(active);
+    drawEdgePlusButtons(active);
     drawPanelNumbers(active);
   }
 }

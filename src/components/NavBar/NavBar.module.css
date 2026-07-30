@@ -288,12 +288,23 @@
    #-comment lines can be greyed while the textarea owns editing and the caret. */
 .popupField {
   position: relative;
-  height: 320px;
+  /* Tall enough that the default rules — the wrapped header note plus every seeded line — read in full
+     without scrolling. It still shrinks when the card meets its viewport cap on a short screen. */
+  height: 420px;
   overflow: hidden;
 }
 
-/* Shared text metrics — the backdrop and the textarea MUST match exactly so the
-   highlighted text sits perfectly under what's typed. */
+/* Shared text metrics — the backdrop and the textarea MUST match exactly, or the coloured text drifts out
+   from under the caret. Three things in here are load-bearing, not cosmetic:
+
+   1. `line-height` is an INTEGER px, never a unitless ratio. At 15px, `1.5` computes to 22.5px, and a
+      textarea's internal line boxes and a div's round that half-pixel independently — the error accumulates
+      down the file until the text sits a whole line off the caret.
+   2. `overflow` is identical on BOTH axes for both boxes. A scrollbar consumes content width, so if only
+      one of them reserves that space its lines wrap earlier and everything below falls out of register.
+      Matching `scroll` (rather than trusting `scrollbar-gutter` to behave the same on `hidden` as on
+      `auto`) makes the two content widths equal by construction, in every engine.
+   3. Every font property is pinned, so no textarea UA default can slip in a different advance width. */
 .popupHighlight,
 .popupInput {
   box-sizing: border-box;
@@ -306,19 +317,28 @@
 
   font-family: inherit;
   font-size: 15px;
-  line-height: 1.5;
+  font-weight: 400;
+  font-style: normal;
+  line-height: 24px;
   letter-spacing: normal;
+  word-spacing: normal;
+  text-indent: 0;
+  tab-size: 4;
   white-space: pre-wrap;
   overflow-wrap: break-word;
+  word-break: normal;
   border: 0;
+  overflow-x: hidden;
+  overflow-y: scroll;
 }
 
-/* Backdrop: shows the text (normal dark; comments lighter grey). Never interactive. */
+/* Backdrop: shows the text (normal dark; comments lighter grey). Never interactive — its own scrollbar
+   sits underneath the textarea's, which is opaque and receives the events; the two are scroll-synced so
+   they coincide. It keeps that scrollbar purely so both boxes reserve the same gutter (see above). */
 .popupHighlight {
   color: #18181b;
   pointer-events: none;
   user-select: none;
-  overflow: hidden;
 }
 
 /* Comment lines (Python-style #…) — lighter grey, signalling they're ignored. */
@@ -343,7 +363,18 @@
   background: transparent;
   resize: none;
   outline: none;
-  overflow-y: auto;
+}
+
+/* Selecting text has to be translucent here. The textarea's glyphs are transparent and the readable text
+   lives on the backdrop BELOW it, so an opaque selection band — the browser default — paints over the very
+   words being selected and the selection reads as an empty blue block. A translucent wash tints them
+   instead, leaving them legible. */
+.popupInput::selection {
+  background: rgba(37, 99, 235, 0.28);
+}
+
+.popupInput::-moz-selection {
+  background: rgba(37, 99, 235, 0.28);
 }
 
 .popupInput::placeholder {
@@ -355,109 +386,6 @@
 .libraryField {
   height: 520px;
   max-height: calc(100vh - 200px);
-}
-
-/* ---- Analyze popup (Facade standardization breakdown) ---------------- */
-
-/* Scrollable body listing the standardized panel types. */
-.analyzeBody {
-  padding: 12px;
-  max-height: calc(100vh - 200px);
-  overflow-y: auto;
-}
-
-/* Empty state when no panels have been placed yet. */
-.analyzeEmpty {
-  margin: 8px 4px;
-  font-size: 12px;
-  line-height: 1.5;
-  color: #71717a;
-}
-
-/* Totals strip above the type list (panel count · unique types). */
-.analyzeSummary {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 4px 6px 10px;
-  margin-bottom: 8px;
-  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
-  font-size: 12px;
-  color: #71717a;
-}
-
-.analyzeSummary strong {
-  color: #18181b;
-  font-weight: 700;
-}
-
-.panelTypeList {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-/* One standardized-type row — a button so the whole row selects that type's panels. */
-.panelTypeRow {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border: 1px solid rgba(15, 23, 42, 0.08);
-  border-radius: 10px;
-  background: #ffffff;
-  font-family: inherit;
-  text-align: left;
-  cursor: pointer;
-  transition:
-    border-color 120ms ease,
-    background 120ms ease;
-}
-
-.panelTypeRow:hover {
-  border-color: rgba(15, 23, 42, 0.18);
-  background: #fafafa;
-}
-
-/* Colour chip matching the panel's on-canvas type colour. */
-.panelTypeSwatch {
-  flex: 0 0 auto;
-  width: 18px;
-  height: 18px;
-  border-radius: 5px;
-  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.18);
-}
-
-.panelTypeInfo {
-  flex: 1 1 auto;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.panelTypeName {
-  font-size: 13px;
-  font-weight: 600;
-  color: #18181b;
-}
-
-.panelTypeDims {
-  font-size: 11px;
-  color: #71717a;
-}
-
-/* Count badge ("×N") at the row's trailing edge. */
-.panelTypeCount {
-  flex: 0 0 auto;
-  font-size: 13px;
-  font-weight: 700;
-  color: #3f3f46;
-  font-variant-numeric: tabular-nums;
 }
 
 /* Library nav button while a canvas selection is dragged over it: a blue, raised

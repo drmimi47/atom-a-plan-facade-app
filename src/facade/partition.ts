@@ -110,26 +110,16 @@ export interface FacadeLayer {
    */
   grids: (BaseGrid | null)[];
   /**
-   * Edge-Profile rationalization mode (Optimize → "Edge Profile"). When true, ONLY cells that sit entirely
-   * inside the trim border count and render as panels — so every panel is a full standard rectangle — and the
-   * leftover perimeter (the diagonal off-cuts) is shown as one consistent trim band instead of many unique
-   * sliced panels. Absent/false ⇒ normal clip-to-border behaviour.
+   * PER-BORDER rationalization mode, indexed alongside `borders`. Each shape carries its own — one facade
+   * can have a stair-stepped tower beside a trim-banded podium — and the modes are mutually exclusive by
+   * construction, where three independent booleans could contradict each other. Null/absent ⇒ the normal
+   * clip-to-border behaviour (panels sliced by the boundary).
+   *
+   *  - `edge-profile`:    only whole cells count as panels; the leftover perimeter becomes one trim band.
+   *  - `stepped-edge`:    only whole cells, packed toward the boundary — a stair-step silhouette.
+   *  - `modular-cluster`: panels group into fabrication FAMILIES by cut ANGLE rather than exact shape.
    */
-  edgeProfile?: boolean;
-  /**
-   * Modular-Clustering rationalization mode (Optimize → "Modular Clustering"). When true, panels are grouped
-   * into fabrication FAMILIES instead of by exact shape: a cut panel's identity is its cut ANGLE (one CNC
-   * setup), so every perimeter cut of the same angle is one reusable type regardless of length; standard
-   * panels group by size. Absent/false ⇒ identity is the exact clipped shape.
-   */
-  modularCluster?: boolean;
-  /**
-   * Stepped-Edge rationalization mode (Optimize → "Stepped Edge" / pixelated). When true, every cell that is
-   * at least half inside the border is kept as a FULL rectangle and the rest are dropped — so the smooth
-   * diagonal is quantized into a staggered stair-step silhouette built entirely of identical whole panels
-   * (the cells render unclipped). Absent/false ⇒ normal clip-to-border behaviour.
-   */
-  steppedEdge?: boolean;
+  borderModes?: (PanelMode | null)[];
   /**
    * Per-group frame overrides (Edit-a-panel). Maps a panel GROUP key (the `cellGroups` shape key) to its
    * per-edge inset frame widths in WORLD units (n=top, e=right, s=bottom, w=left). Drawn as an inset band inside
@@ -196,6 +186,28 @@ export type CellRef =
  * Algorithms are implemented one at a time; see `panelStats` for the metric they minimize.
  */
 export type OptimizeStrategy = 'edge-normalize' | 'edge-profile' | 'modular-cluster' | 'stepped-edge';
+
+/**
+ * The subset of {@link OptimizeStrategy} that is a persistent per-border MODE rather than a one-shot edit.
+ * `edge-normalize` is excluded: it snaps the outline onto the grid once and leaves no state behind, so it
+ * is an action, not something a border can "be in".
+ */
+export type PanelMode = 'edge-profile' | 'modular-cluster' | 'stepped-edge';
+
+/** The rationalization mode a border is in, or null for the default sliced-panel behaviour. */
+export function borderMode(layer: FacadeLayer, border: number): PanelMode | null {
+  return layer.borderModes?.[border] ?? null;
+}
+
+/** Put a border into a mode (null clears it). Returns whether anything changed. */
+export function setBorderMode(layer: FacadeLayer, border: number, mode: PanelMode | null): boolean {
+  if (border < 0 || border >= layer.borders.length) return false;
+  if (borderMode(layer, border) === mode) return false;
+  if (!layer.borderModes) layer.borderModes = [];
+  while (layer.borderModes.length < layer.borders.length) layer.borderModes.push(null);
+  layer.borderModes[border] = mode;
+  return true;
+}
 
 /* -------------------------------------------------------------------------- */
 /*  Construction                                                               */
@@ -538,14 +550,52 @@ function borderCellRects(layer: FacadeLayer, b: number): Rect[] {
     }
   }
   if (poly.length >= 3) {
-    // Stepped-Edge mode: keep every cell at least HALF inside the border (rendered unclipped as a full rect),
-    // quantizing the diagonal into a stair-step of identical whole panels.
-    if (layer.steppedEdge) return out.filter((r) => rectInsideRatio(r, poly) >= 0.5);
-    // Edge-Profile mode: keep only cells WHOLLY inside the border — those are the standard rectangular panels;
-    // everything the border slices becomes the perimeter trim band (drawn separately) instead of a panel.
-    if (layer.edgeProfile) return out.filter((r) => rectInsideRatio(r, poly) >= 1 - 1e-3);
+    // Both modes keep only panels lying WHOLLY inside the border — every one a full rectangle that fits
+    // within the boundary, never spilling past the outline the user drew.
+    //
+    // Stepped Edge then PACKS the leftover: a cell the border cuts is quartered and retried, so smaller
+    // whole panels step in toward the diagonal instead of the gap being abandoned. Edge Profile keeps the
+    // gap deliberately and fills it with one continuous trim band instead.
+    const mode = borderMode(layer, b);
+    if (mode === 'stepped-edge') {
+      const packed: Rect[] = [];
+      for (const r of out) packSteppedCell(r, poly, 0, packed);
+      return packed;
+    }
+    if (mode === 'edge-profile') return out.filter((r) => rectInsideRatio(r, poly) >= 1 - 1e-3);
   }
   return out;
+}
+
+/**
+ * How many times a Stepped-Edge boundary cell may be split to chase the border. Each level halves both
+ * sides, so this caps the facade at TWO panel sizes: the base module and one half-module infill. Going
+ * deeper closes the last slivers but adds a third and fourth size — the shop tools every one of them, so
+ * the boundary fidelity is not worth the fabrication.
+ */
+const STEP_PACK_MAX_DEPTH = 1;
+
+/**
+ * Pack one Stepped-Edge cell against the border, quadtree style. A cell that fits whole is kept; one that
+ * straddles the boundary is quartered and each piece retried, down to {@link STEP_PACK_MAX_DEPTH}. The
+ * result is a two-size stair-step — full panels across the field, half-modules stepping in along the
+ * diagonal — where every panel is still an orthogonal rectangle lying entirely inside the shape.
+ */
+function packSteppedCell(rect: Rect, border: Vec2[], depth: number, out: Rect[]): void {
+  const ratio = rectInsideRatio(rect, border);
+  if (ratio >= 1 - 1e-3) {
+    out.push(rect); // fits whole
+    return;
+  }
+  if (ratio <= 1e-6) return; // nothing of it is inside
+  if (depth >= STEP_PACK_MAX_DEPTH) return; // any smaller stops being a buildable panel
+  const hw = rect.w / 2;
+  const hh = rect.h / 2;
+  const next = depth + 1;
+  packSteppedCell({ x: rect.x, y: rect.y, w: hw, h: hh }, border, next, out);
+  packSteppedCell({ x: rect.x + hw, y: rect.y, w: hw, h: hh }, border, next, out);
+  packSteppedCell({ x: rect.x + hw, y: rect.y + hh, w: hw, h: hh }, border, next, out);
+  packSteppedCell({ x: rect.x, y: rect.y + hh, w: hw, h: hh }, border, next, out);
 }
 
 /** Every leaf cell rect to draw across ALL borders (each border contributes its own independent lattice). */
@@ -721,13 +771,39 @@ function polyArea(poly: Vec2[]): number {
  * min, quantised. A full rectangle and a border-sliced trapezoid/triangle therefore key differently.
  */
 function clipShapeKey(poly: Vec2[]): string {
+  // Normalise before hashing, because the SAME panel can come out of the clipper in different guises:
+  // Sutherland-Hodgman may start the ring at a different vertex, and a border edge grazing a cell leaves
+  // collinear points behind. Keying the raw vertex list made 30 identical rectangles report as 3 distinct
+  // panel types — inflating the very "unique panels" figure the Optimize strategies exist to minimise.
+  //
+  // Two passes: drop vertices that bend nothing, then rotate the ring to start at its lowest vertex.
+  // Winding is preserved, so a mirrored panel stays a different part (it is, to a fabricator).
+  const pts: Vec2[] = [];
+  for (let i = 0; i < poly.length; i++) {
+    const prev = poly[(i + poly.length - 1) % poly.length];
+    const cur = poly[i];
+    const next = poly[(i + 1) % poly.length];
+    const cross = (cur.x - prev.x) * (next.y - cur.y) - (cur.y - prev.y) * (next.x - cur.x);
+    const dup = Math.abs(cur.x - prev.x) < 1e-6 && Math.abs(cur.y - prev.y) < 1e-6;
+    if (!dup && Math.abs(cross) > 1e-6) pts.push(cur);
+  }
+  const ring = pts.length >= 3 ? pts : poly;
+
   let minX = Infinity;
   let minY = Infinity;
-  for (const p of poly) {
+  for (const p of ring) {
     minX = Math.min(minX, p.x);
     minY = Math.min(minY, p.y);
   }
-  return poly.map((p) => `${Math.round((p.x - minX) * 10)},${Math.round((p.y - minY) * 10)}`).join(';');
+  const q = ring.map((p) => ({ x: Math.round((p.x - minX) * 10), y: Math.round((p.y - minY) * 10) }));
+  let start = 0;
+  for (let i = 1; i < q.length; i++) {
+    if (q[i].x < q[start].x || (q[i].x === q[start].x && q[i].y < q[start].y)) start = i;
+  }
+  return q
+    .map((_, i) => q[(start + i) % q.length])
+    .map((p) => `${p.x},${p.y}`)
+    .join(';');
 }
 
 /** Angle tolerance (degrees) for clustering cut edges into one fabrication family / CNC setup. */
@@ -781,17 +857,28 @@ function clusterFamilyKey(poly: Vec2[]): string {
  * Each VISIBLE cell (clipped area > 0) with its rect and material GROUP KEY — the clipped-shape identity
  * also used by the Material-ID colours. Cells with the same key are "the same panel" (group-selectable).
  */
-export function cellGroups(layer: FacadeLayer): { rect: Rect; key: string; cx: number; cy: number }[] {
-  const out: { rect: Rect; key: string; cx: number; cy: number }[] = [];
+export function cellGroups(
+  layer: FacadeLayer,
+): { rect: Rect; key: string; cx: number; cy: number; border: number }[] {
+  const out: { rect: Rect; key: string; cx: number; cy: number; border: number }[] = [];
   // Each border's cells are clipped to THAT border only — so its pattern is independent of the others. Keys
   // are translation-invariant, so identical panel shapes still share a material/frame across every border.
   for (let b = 0; b < layer.borders.length; b++) {
     const border = layer.borders[b];
     for (const r of borderCellRects(layer, b)) {
-      // Stepped-Edge mode: each kept cell IS a full rectangle (drawn unclipped) — identity is its size, so
-      // every whole panel is the same type. Centre the label on the rect itself.
-      if (layer.steppedEdge) {
-        out.push({ rect: r, key: clipShapeKey(rectCorners(r)), cx: r.x + r.w / 2, cy: r.y + r.h / 2 });
+      // Stepped-Edge and Edge-Profile both keep only cells that fit the border, so a kept panel IS its full
+      // rectangle: identity is its size. Keying off the CLIPPED polygon instead would split one panel type
+      // into several, because a cell sitting a hair inside the tolerance comes back with a shaved corner —
+      // which is exactly the unique-panel count these two strategies exist to collapse.
+      const bmode = borderMode(layer, b);
+      if (bmode === 'stepped-edge' || bmode === 'edge-profile') {
+        out.push({
+          rect: r,
+          key: clipShapeKey(rectCorners(r)),
+          cx: r.x + r.w / 2,
+          cy: r.y + r.h / 2,
+          border: b,
+        });
         continue;
       }
       const clipped = clipCellToBorder(r, border);
@@ -803,8 +890,8 @@ export function cellGroups(layer: FacadeLayer): { rect: Rect; key: string; cx: n
         cx += p.x;
         cy += p.y;
       }
-      const key = layer.modularCluster ? clusterFamilyKey(clipped) : clipShapeKey(clipped);
-      out.push({ rect: r, key, cx: cx / clipped.length, cy: cy / clipped.length });
+      const key = bmode === 'modular-cluster' ? clusterFamilyKey(clipped) : clipShapeKey(clipped);
+      out.push({ rect: r, key, cx: cx / clipped.length, cy: cy / clipped.length, border: b });
     }
   }
   return out;
@@ -824,11 +911,11 @@ export function cellNumbers(layer: FacadeLayer): { cx: number; cy: number; num: 
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Per-group frames (Edit-a-panel)                                            */
+/*  Per-panel frames (Edit-a-panel)                                            */
 /* -------------------------------------------------------------------------- */
 
-/** The frame override for a group key, or null. */
-export function groupFrame(layer: FacadeLayer, key: string): GroupFrame | null {
+/** The frame override for a CELL, or null. */
+export function panelFrameAt(layer: FacadeLayer, key: string): GroupFrame | null {
   return layer.frames?.[key] ?? null;
 }
 
@@ -907,17 +994,17 @@ export function panelBorderEdges(layer: FacadeLayer, rect: Rect): [Vec2, Vec2][]
   return out;
 }
 
-/** The first visible cell rect of a group (representative panel for the camera focus + edge hit-testing). */
-export function representativeCell(layer: FacadeLayer, key: string): Rect | null {
-  for (const g of cellGroups(layer)) if (g.key === key) return g.rect;
+/** The rect of a specific CELL (representative panel for the camera focus + edge hit-testing). */
+export function representativeCell(layer: FacadeLayer, cell: string): Rect | null {
+  for (const g of cellGroups(layer)) if (cellKey(g.rect) === cell) return g.rect;
   return null;
 }
 
 /**
- * Seed a uniform frame (all four sides = `widthWorld`) on every given group key that has no override yet.
+ * Seed a uniform frame (all four sides = `widthWorld`) on every given CELL that has no override yet.
  * Returns true if anything was added. Used when an Edit session first opens on a selection.
  */
-export function seedGroupFrames(layer: FacadeLayer, keys: Iterable<string>, widthWorld: number): boolean {
+export function seedPanelFrames(layer: FacadeLayer, keys: Iterable<string>, widthWorld: number): boolean {
   if (!layer.frames) layer.frames = {};
   let added = false;
   for (const key of keys) {
@@ -929,19 +1016,26 @@ export function seedGroupFrames(layer: FacadeLayer, keys: Iterable<string>, widt
   return added;
 }
 
-/** Write the full per-edge frame to every given group key (the mirror across the group). */
-export function setGroupFrame(layer: FacadeLayer, keys: Iterable<string>, frame: GroupFrame): void {
+/** Write the full per-edge frame to every given CELL — exactly the panels selected, no others. */
+export function setPanelFrame(layer: FacadeLayer, keys: Iterable<string>, frame: GroupFrame): void {
   if (!layer.frames) layer.frames = {};
   for (const key of keys) layer.frames[key] = { ...frame };
 }
 
-/** The assigned panel material kind for a group key, or null. */
-export function groupPanelKind(layer: FacadeLayer, key: string): PanelKind | null {
+/** The assigned panel material kind for a CELL, or null. */
+export function panelKindAt(layer: FacadeLayer, key: string): PanelKind | null {
   return layer.panelKinds?.[key] ?? null;
 }
 
-/** Assign a panel material kind to every given group key (mirrors across the group), or clear it with null. */
-export function setGroupPanelKind(layer: FacadeLayer, keys: Iterable<string>, kind: PanelKind | null): void {
+/**
+ * Assign a panel material kind to every given CELL, or clear it with null.
+ *
+ * Keyed per CELL, not per shape. Keying by clipped-shape meant assigning a material to one panel silently
+ * repainted every identical panel on the elevation — which is not a choice a facade designer can express
+ * ("this bay is spandrel, the one beside it is vision" is the normal case). Selecting several panels and
+ * assigning once still covers the batch; that is what the selection is for.
+ */
+export function setPanelKind(layer: FacadeLayer, keys: Iterable<string>, kind: PanelKind | null): void {
   if (!layer.panelKinds) layer.panelKinds = {};
   for (const key of keys) {
     if (kind) layer.panelKinds[key] = kind;
@@ -950,12 +1044,20 @@ export function setGroupPanelKind(layer: FacadeLayer, keys: Iterable<string>, ki
 }
 
 /**
- * Run a lattice mutation (slide a line/segment) while keeping any per-group frames attached to the SAME
- * panels at the SAME world-unit widths. Frames are keyed by clipped-shape, so resizing a panel changes its
- * key and would otherwise orphan the frame. We snapshot each visible panel's frame in positional order,
- * apply the move, then re-key those frames onto the panels' new shapes — so the mullion band stays a constant
- * size as the glass area grows/shrinks. The cell topology (base-cell range, subdivisions) is unchanged by a
- * line move, so `cellGroups` order lines up before/after. No-op overhead when the layer has no frames.
+ * Run a geometry mutation (move/reshape a border, slide a line or segment) while keeping every panel's
+ * frame and assigned material attached to the SAME panel. Both are keyed by cell POSITION, so anything
+ * that shifts a cell would otherwise orphan its properties.
+ *
+ * Two rules, in order — matching purely by list position is NOT enough:
+ *
+ *  1. A panel whose cell key is unchanged keeps its properties outright. Growing a border only reveals
+ *     more of the fixed lattice; the panels already there do not move. Re-keying them by list index is
+ *     what used to corrupt this — stretching WEST or NORTH prepends the new cells, shifting every
+ *     existing panel one slot down the list and dragging its material onto its neighbour.
+ *  2. Whatever is left over genuinely moved (a translate, a line slide, a rescale). Those match in list
+ *     order, which the shared iteration order keeps consistent across the mutation.
+ *
+ * No-op overhead when the layer has neither frames nor materials.
  */
 export function moveLatticePreservingFrames(layer: FacadeLayer, mutate: () => void): void {
   const hasFrames = !!layer.frames && Object.keys(layer.frames).length > 0;
@@ -964,29 +1066,36 @@ export function moveLatticePreservingFrames(layer: FacadeLayer, mutate: () => vo
     mutate();
     return;
   }
-  const before = cellGroups(layer);
-  // Snapshot each panel's frame + assigned kind (in positional order) so they re-attach to the resized shapes.
-  const perFrame = before.map((g) => (hasFrames ? layer.frames![g.key] ?? null : null));
-  const perKind = before.map((g) => (hasKinds ? layer.panelKinds![g.key] ?? null : null));
+  const before = cellGroups(layer).map((g) => cellKey(g.rect));
+  const perFrame = before.map((k) => (hasFrames ? layer.frames![k] ?? null : null));
+  const perKind = before.map((k) => (hasKinds ? layer.panelKinds![k] ?? null : null));
   mutate();
-  const after = cellGroups(layer);
-  const n = Math.min(before.length, after.length);
-  if (hasFrames) {
-    const next: Record<string, GroupFrame> = {};
-    for (let k = 0; k < n; k++) {
-      const f = perFrame[k];
-      if (f) next[after[k].key] = { ...f }; // same widths → constant band size, now under the resized shape's key
-    }
-    layer.frames = next;
+  const after = cellGroups(layer).map((g) => cellKey(g.rect));
+
+  const beforeSet = new Set(before);
+  const afterSet = new Set(after);
+  const nextFrames: Record<string, GroupFrame> = {};
+  const nextKinds: Record<string, PanelKind> = {};
+  const put = (key: string, i: number) => {
+    const f = perFrame[i];
+    if (f) nextFrames[key] = { ...f };
+    const kind = perKind[i];
+    if (kind) nextKinds[key] = kind;
+  };
+
+  // 1. Panels that stayed exactly where they were.
+  const moved: number[] = [];
+  for (let i = 0; i < before.length; i++) {
+    if (afterSet.has(before[i])) put(before[i], i);
+    else moved.push(i);
   }
-  if (hasKinds) {
-    const next: Record<string, PanelKind> = {};
-    for (let k = 0; k < n; k++) {
-      const kind = perKind[k];
-      if (kind) next[after[k].key] = kind;
-    }
-    layer.panelKinds = next;
-  }
+  // 2. Panels that shifted, paired with the new positions nothing else claimed.
+  const vacated = after.filter((k) => !beforeSet.has(k));
+  const n = Math.min(moved.length, vacated.length);
+  for (let k = 0; k < n; k++) put(vacated[k], moved[k]);
+
+  if (hasFrames) layer.frames = nextFrames;
+  if (hasKinds) layer.panelKinds = nextKinds;
 }
 
 /**
@@ -1001,21 +1110,250 @@ export function panelStats(layer: FacadeLayer): { total: number; unique: number 
   return { total: groups.length, unique: new Set(groups.map((g) => g.key)).size };
 }
 
+/** Per-material figures behind the live facade readouts. See {@link PANEL_PERFORMANCE}. */
+interface PanelPerformance {
+  /** Assembly U-factor, Btu/h·ft²·°F (lower = better insulated). */
+  uValue: number;
+  /** Supply + install, US$ per ft² of facade — the all-in rate a cost plan carries, not material only. */
+  costPerSqft: number;
+  /** Share of the panel's area that is vision glass, 0–1 — what the window-to-wall ratio counts. */
+  visionFraction: number;
+}
+
+/**
+ * Nominal performance + cost per panel material.
+ *
+ * PLACEHOLDER DATA — mid-market US rates for a unitised curtain wall, right to an order of magnitude but
+ * not a specification. Real numbers come from the assembly's tested NFRC/ASHRAE data and a live cost book;
+ * wire those in here and every readout that reads from this table follows.
+ */
+const PANEL_PERFORMANCE: Record<PanelKind, PanelPerformance> = {
+  vision1: { uValue: 1.04, costPerSqft: 58, visionFraction: 1 },
+  vision2: { uValue: 0.48, costPerSqft: 82, visionFraction: 1 },
+  vision3: { uValue: 0.28, costPerSqft: 118, visionFraction: 1 },
+  spandrel: { uValue: 0.32, costPerSqft: 64, visionFraction: 0 },
+  solid: { uValue: 0.09, costPerSqft: 52, visionFraction: 0 },
+  cladding: { uValue: 0.07, costPerSqft: 95, visionFraction: 0 },
+  louver: { uValue: 1.2, costPerSqft: 105, visionFraction: 0 },
+};
+
+/**
+ * What a panel counts as before the user assigns it a material: a generic unitised bay, part vision and
+ * part spandrel, at a blended rate. Treating unassigned panels as full vision units (the obvious shortcut)
+ * both reads WWR 100% — which is not a real facade — and prices the whole elevation at the glass rate.
+ */
+const UNASSIGNED_PANEL: PanelPerformance = { uValue: 0.42, costPerSqft: 68, visionFraction: 0.55 };
+
+/** Live facade readouts for the active layer — see {@link facadeMetrics}. */
+export interface FacadeMetrics {
+  /** Visible panels across every border. */
+  panels: number;
+  /** Distinct panel SHAPES — the fabrication types to be tooled and tracked. */
+  types: number;
+  /** Repetition: share of panels that reuse an existing type, 0–100. Higher ⇒ cheaper to fabricate. */
+  standardizationPct: number;
+  /** Total clipped facade area, ft². */
+  areaSqft: number;
+  /** Window-to-wall ratio: vision-glass area ÷ facade area, 0–100. */
+  wwrPct: number;
+  /** Area-weighted assembly U-factor, Btu/h·ft²·°F. */
+  uValue: number;
+  /** Supply + install estimate, US$. */
+  cost: number;
+}
+
+/**
+ * Live facade engineering readouts for the active layer, computed from the real partition: panel and type
+ * counts, clipped areas (so a border-sliced panel contributes only the glass that survives the cut), and
+ * area-weighted performance rolled up from {@link PANEL_PERFORMANCE}. `worldPerFoot` converts world units
+ * to feet so the caller owns the unit scale.
+ *
+ * The geometry is real; the per-material performance and cost constants are placeholders (see that table).
+ */
+export function facadeMetrics(layer: FacadeLayer, worldPerFoot: number): FacadeMetrics {
+  const empty: FacadeMetrics = {
+    panels: 0,
+    types: 0,
+    standardizationPct: 0,
+    areaSqft: 0,
+    wwrPct: 0,
+    uValue: 0,
+    cost: 0,
+  };
+  if (!hasBoundary(layer)) return empty;
+
+  const sqftPerWorld = 1 / (worldPerFoot * worldPerFoot);
+  const keys = new Set<string>();
+  let panels = 0;
+  let areaSqft = 0;
+  let visionSqft = 0;
+  let uArea = 0; // Σ (U × area) — divided by total area for the area-weighted U-factor
+  let cost = 0;
+
+  for (let b = 0; b < layer.borders.length; b++) {
+    const border = layer.borders[b];
+    for (const rect of borderCellRects(layer, b)) {
+      // Stepped-Edge keeps whole rectangles; every other mode bills only the area inside the trim.
+      const bmode = borderMode(layer, b);
+      const poly =
+        bmode === 'stepped-edge' ? rectCorners(rect) : clipCellToBorder(rect, border);
+      if (poly.length < 3) continue;
+      const areaWorld = polyArea(poly);
+      if (areaWorld < 1e-6) continue;
+      const key = bmode === 'modular-cluster' ? clusterFamilyKey(poly) : clipShapeKey(poly);
+      keys.add(key);
+      panels += 1;
+      const sqft = areaWorld * sqftPerWorld;
+      areaSqft += sqft;
+      const kind = panelKindAt(layer, cellKey(rect));
+      const perf = kind ? PANEL_PERFORMANCE[kind] : UNASSIGNED_PANEL;
+      visionSqft += perf.visionFraction * sqft;
+      uArea += perf.uValue * sqft;
+      cost += perf.costPerSqft * sqft;
+    }
+  }
+
+  if (panels === 0) return empty;
+  return {
+    panels,
+    types: keys.size,
+    standardizationPct: Math.round((1 - keys.size / panels) * 100),
+    areaSqft: Math.round(areaSqft),
+    wwrPct: areaSqft > 0 ? Math.round((visionSqft / areaSqft) * 100) : 0,
+    uValue: areaSqft > 0 ? uArea / areaSqft : 0,
+    cost: Math.round(cost),
+  };
+}
+
 /** Is a world point inside ANY of the layer's trim borders? (False before a boundary is drawn.) */
 export function pointInBorder(layer: FacadeLayer, pt: Vec2): boolean {
   return hasBoundary(layer) && borderPolygons(layer).some((b) => pointInPolygon(pt, b));
 }
 
-/** Every visible panel GROUP key whose cell overlaps the given world rect (for rubber-band multi-select). */
-export function groupKeysInRect(layer: FacadeLayer, rect: Rect): string[] {
+/**
+ * Positional identity of ONE panel — its cell rect, quantised. A material GROUP key is shared by every
+ * identical panel on the facade, so it can't name a single one; this can. Selection is stored as cell keys so
+ * a rubber-band sweep selects only the panels it actually covered, the way a Plan-mode marquee does.
+ *
+ * The lattice is recomputed each frame at the same coordinates, so a key stays valid until the grid or border
+ * genuinely moves — after which stale keys simply stop matching and the selection lapses (the callers that
+ * reshape a border clear it outright).
+ */
+export function cellKey(rect: Rect): string {
+  const q = (v: number) => Math.round(v * 1000);
+  return `${q(rect.x)}:${q(rect.y)}:${q(rect.w)}:${q(rect.h)}`;
+}
+
+/** Every visible panel's cell key whose rect overlaps the given world rect (for rubber-band multi-select). */
+export function cellKeysInRect(layer: FacadeLayer, rect: Rect): string[] {
   const keys = new Set<string>();
-  for (const { rect: r, key } of cellGroups(layer)) {
-    // Axis-aligned overlap: the marquee selects any group a cell of it touches.
+  for (const { rect: r } of cellGroups(layer)) {
+    // Axis-aligned overlap: the marquee selects any panel it touches — and ONLY those.
     if (r.x < rect.x + rect.w && r.x + r.w > rect.x && r.y < rect.y + rect.h && r.y + r.h > rect.y) {
-      keys.add(key);
+      keys.add(cellKey(r));
     }
   }
   return [...keys];
+}
+
+/** Every cell key in the material group `groupKey` — a click selects a panel's whole group. */
+export function groupCellKeys(layer: FacadeLayer, groupKey: string): string[] {
+  const keys: string[] = [];
+  for (const g of cellGroups(layer)) if (g.key === groupKey) keys.push(cellKey(g.rect));
+  return keys;
+}
+
+/**
+ * Has this border actually been split into panels yet?
+ *
+ * Until the first split a border has no grid, and {@link cellRects} reports its whole extent as ONE cell so
+ * the boundary still paints as a solid surface. That pseudo-panel is a drawing convenience, not a panel: it
+ * is the raw elevation the user has yet to subdivide. Anything that reasons about panels as fabricated units
+ * — above all the facade constraints — has to ask this first, or it will measure the entire facade as a
+ * single enormous sheet of glass.
+ */
+export function isSubdivided(layer: FacadeLayer, border: number): boolean {
+  return layer.grids[border] != null;
+}
+
+/** True once ANY border on the layer has been split — i.e. the facade has real panels to reason about. */
+export function hasPanels(layer: FacadeLayer): boolean {
+  return layer.borders.some((_, b) => isSubdivided(layer, b));
+}
+
+/** The live panel rects behind a set of selected cell keys (keys are positional, so stale ones drop out). */
+export function cellRectsOf(layer: FacadeLayer, cells: Set<string>): Rect[] {
+  const out: Rect[] = [];
+  for (const g of cellGroups(layer)) if (cells.has(cellKey(g.rect))) out.push(g.rect);
+  return out;
+}
+
+/**
+ * The world extent of the current panel selection: one panel's own rect, or the box enclosing several.
+ * The floating panel menu hangs off the BOTTOM CENTRE of this rect and reads its width/height, so the bar
+ * follows whatever is selected — no right-click, and no re-anchoring when the selection grows.
+ */
+export function selectedCellsExtent(layer: FacadeLayer, cells: Set<string>): Rect | null {
+  const rects = cellRectsOf(layer, cells);
+  if (!rects.length) return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const r of rects) {
+    if (r.x < minX) minX = r.x;
+    if (r.y < minY) minY = r.y;
+    if (r.x + r.w > maxX) maxX = r.x + r.w;
+    if (r.y + r.h > maxY) maxY = r.y + r.h;
+  }
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+/**
+ * The world extent of the selected BORDERS — Border mode's equivalent of {@link selectedCellsExtent}, so the
+ * floating menu can hang under a freshly placed boundary before it has any panels to select.
+ */
+export function selectedBordersExtent(layer: FacadeLayer, indices: Set<number>): Rect | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let count = 0;
+  for (const i of indices) {
+    const poly = layer.borders[i];
+    if (!poly) continue;
+    const b = polyBBox(poly);
+    if (b.x < minX) minX = b.x;
+    if (b.y < minY) minY = b.y;
+    if (b.x + b.w > maxX) maxX = b.x + b.w;
+    if (b.y + b.h > maxY) maxY = b.y + b.h;
+    count++;
+  }
+  if (!count) return null;
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+/**
+ * The distinct material GROUP keys behind a set of selected cells — the bridge back to the group-level
+ * operations (assign material, Edit-a-panel frames) that still act on a whole panel type at once.
+ */
+export function groupKeysOfCells(layer: FacadeLayer, cells: Set<string>): string[] {
+  const keys = new Set<string>();
+  for (const g of cellGroups(layer)) if (cells.has(cellKey(g.rect))) keys.add(g.key);
+  return [...keys];
+}
+
+/**
+ * The CELL key of the panel under a world point — the individual unit, not its material group. This is
+ * what a paint stroke collects: dragging across the elevation adds exactly the panels the cursor touched,
+ * leaving their identical twins elsewhere alone.
+ */
+export function cellKeyAt(layer: FacadeLayer, pt: Vec2): string | null {
+  if (!pointInBorder(layer, pt)) return null;
+  for (const { rect: r } of cellGroups(layer)) {
+    if (pt.x >= r.x && pt.x <= r.x + r.w && pt.y >= r.y && pt.y <= r.y + r.h) return cellKey(r);
+  }
+  return null;
 }
 
 /** The material group key of the cell under a world point (for group-select), or null. */
@@ -1312,6 +1650,116 @@ export function moveBorder(layer: FacadeLayer, index: number, dx: number, dy: nu
   if (grid) translateGrid(grid, dx, dy);
 }
 
+/**
+ * Deep-copy border `index` — its outline, anchor rect, and whole lattice — offset by (dx, dy) and appended
+ * on top. The copy is fully independent, so editing either one's panels leaves the other alone. Returns the
+ * new border's index, or null when `index` names no border. This is the Layers-tool answer to Alt-dragging
+ * a room in Plan mode.
+ */
+/** The cell keys of ONE border's visible panels, in the order `cellGroups` walks them. */
+function borderCellKeys(layer: FacadeLayer, border: number): string[] {
+  const out: string[] = [];
+  for (const g of cellGroups(layer)) if (g.border === border) out.push(cellKey(g.rect));
+  return out;
+}
+
+/**
+ * Copy every per-panel frame and material from one border's cells onto another's, matched in positional
+ * order. Panel properties are keyed by cell POSITION, so a copy of a shape starts blank unless its panels
+ * are re-keyed onto the new positions — which is what makes a duplicated facade arrive fully clad rather
+ * than stripped back to bare glass.
+ */
+function copyPanelProps(layer: FacadeLayer, from: number, to: number): void {
+  const src = borderCellKeys(layer, from);
+  const dst = borderCellKeys(layer, to);
+  const n = Math.min(src.length, dst.length);
+  for (let k = 0; k < n; k++) {
+    const f = layer.frames?.[src[k]];
+    if (f) {
+      if (!layer.frames) layer.frames = {};
+      layer.frames[dst[k]] = { ...f };
+    }
+    const kind = layer.panelKinds?.[src[k]];
+    if (kind) {
+      if (!layer.panelKinds) layer.panelKinds = {};
+      layer.panelKinds[dst[k]] = kind;
+    }
+  }
+}
+
+export function duplicateBorder(layer: FacadeLayer, index: number, dx = 0, dy = 0): number | null {
+  const poly = layer.borders[index];
+  if (!poly) return null;
+  layer.borders.push(poly.map((p) => ({ x: p.x, y: p.y })));
+  const root = layer.roots[index];
+  layer.roots.push(root ? { ...root } : { x: 0, y: 0, w: 0, h: 0 });
+  const grid = layer.grids[index];
+  layer.grids.push(grid ? (JSON.parse(JSON.stringify(grid)) as typeof grid) : null);
+  const next = layer.borders.length - 1;
+  if (dx || dy) moveBorder(layer, next, dx, dy);
+  copyPanelProps(layer, index, next); // the copy arrives with the original's frames + materials
+  return next;
+}
+
+/** One border lifted out of a layer — outline, lattice anchor, and grid — for the copy/paste clipboard. */
+export interface BorderSnapshot {
+  border: Vec2[];
+  root: Rect | null;
+  grid: BaseGrid | null;
+}
+
+/** Detached deep copies of the given borders, in index order (the Layers-tool answer to Ctrl+C). */
+export function copyBorders(layer: FacadeLayer, indices: Iterable<number>): BorderSnapshot[] {
+  const out: BorderSnapshot[] = [];
+  for (const i of [...new Set(indices)].sort((a, b) => a - b)) {
+    const poly = layer.borders[i];
+    if (!poly) continue;
+    const root = layer.roots[i];
+    const grid = layer.grids[i];
+    out.push({
+      border: poly.map((p) => ({ x: p.x, y: p.y })),
+      root: root ? { ...root } : null,
+      grid: grid ? (JSON.parse(JSON.stringify(grid)) as BaseGrid) : null,
+    });
+  }
+  return out;
+}
+
+/**
+ * Append clipboard borders to the layer, offset by (dx, dy) so a paste lands clear of its source. Copies the
+ * snapshots again on the way in, so pasting twice can't alias one clipboard entry into two live borders.
+ * Returns the new borders' indices.
+ */
+export function pasteBorders(
+  layer: FacadeLayer,
+  snapshots: BorderSnapshot[],
+  dx = 0,
+  dy = 0,
+): number[] {
+  const added: number[] = [];
+  for (const snap of snapshots) {
+    layer.borders.push(snap.border.map((p) => ({ x: p.x, y: p.y })));
+    layer.roots.push(snap.root ? { ...snap.root } : null);
+    layer.grids.push(snap.grid ? (JSON.parse(JSON.stringify(snap.grid)) as BaseGrid) : null);
+    const i = layer.borders.length - 1;
+    if (dx || dy) moveBorder(layer, i, dx, dy);
+    added.push(i);
+  }
+  return added;
+}
+
+/**
+ * Delete the given borders (and their anchors + lattices). Removes highest-index first so the earlier
+ * indices stay valid mid-loop. Returns true when anything was removed.
+ */
+export function removeBorders(layer: FacadeLayer, indices: Iterable<number>): boolean {
+  const sorted = [...new Set(indices)]
+    .filter((i) => i >= 0 && i < layer.borders.length)
+    .sort((a, b) => b - a);
+  for (const i of sorted) removeBorderAt(layer, i);
+  return sorted.length > 0;
+}
+
 /** A border corner hit: which border (index into `borders`) and which corner (0..3, [NW,NE,SE,SW]). */
 export interface BorderCornerHit {
   border: number;
@@ -1343,73 +1791,86 @@ export function hitBorderCorner(layer: FacadeLayer, pt: Vec2, tol: number): Bord
  * few (a ~45° edge, slope 1:1, collapses to a single repeating cut). The sub-cell deviation the user drew is
  * absorbed into the snap. No-op when there is no lattice yet, or if nothing moved. Returns whether it changed.
  */
-export function optimizeEdgeNormalize(layer: FacadeLayer): boolean {
-  let changed = false;
-  // Snap each border's corners to its OWN lattice nodes (every border has an independent grid).
-  for (let b = 0; b < layer.borders.length; b++) {
-    const g = layer.grids[b];
-    const poly = layer.borders[b];
-    if (!g || !poly) continue; // un-split border — a single panel, nothing to rationalize
-    const snapped = poly.map((p) => ({
-      x: g.originX + Math.round((p.x - g.originX) / g.pitchX) * g.pitchX,
-      y: g.originY + Math.round((p.y - g.originY) / g.pitchY) * g.pitchY,
-    }));
-    if (snapped.some((p, i) => Math.abs(p.x - poly[i].x) > 1e-6 || Math.abs(p.y - poly[i].y) > 1e-6)) {
-      layer.borders[b] = snapped;
-      changed = true;
-    }
+export function normalizeBorderToGrid(layer: FacadeLayer, border: number): boolean {
+  const g = layer.grids[border];
+  const poly = layer.borders[border];
+  if (!g || !poly) return false; // un-split border — a single panel, nothing to rationalize
+  const snapped = poly.map((p) => ({
+    x: g.originX + Math.round((p.x - g.originX) / g.pitchX) * g.pitchX,
+    y: g.originY + Math.round((p.y - g.originY) / g.pitchY) * g.pitchY,
+  }));
+  if (!snapped.some((p, i) => Math.abs(p.x - poly[i].x) > 1e-6 || Math.abs(p.y - poly[i].y) > 1e-6)) {
+    return false;
   }
-  return changed;
-}
-
-/**
- * EDGE PROFILE rationalization (Optimize → "Edge Profile"). Switch the layer into edge-profile mode: every
- * panel becomes a full standard rectangle (cells the border slices are dropped) and the diagonal off-cuts are
- * shown as one perimeter trim band — so the unique-panel cost collapses onto a single consistent trim. A no-op
- * (returns false) when there's no lattice yet, or when the mode is already on (undo turns it back off).
- */
-export function optimizeEdgeProfile(layer: FacadeLayer): boolean {
-  if (!hasBoundary(layer) || !layer.grids.some((g) => g) || layer.edgeProfile) return false;
-  layer.edgeProfile = true;
+  layer.borders[border] = snapped;
   return true;
 }
 
 /**
- * MODULAR CLUSTERING rationalization (Optimize → "Modular Clustering"). Switch the layer into cluster mode:
- * panels are grouped into fabrication families (cut panels by cut angle, standard panels by size) rather than
- * by exact shape — so a straight diagonal's many trapezoids become one reusable edge type. A no-op (returns
- * false) when there's no lattice yet, or when the mode is already on (undo turns it back off).
+ * Apply a rationalization to ONE border — the single entry point behind the Optimize menu.
+ *
+ * Scoped per border, not per layer: a facade routinely wants a stair-stepped tower next to a trim-banded
+ * podium, and the old layer-wide switches made that impossible to express. `edge-normalize` is a one-shot
+ * edit (snap the outline to the lattice); the other three are modes, so re-picking the active one clears it
+ * and `null` clears it outright. Returns whether anything actually changed, so callers can skip the undo step.
  */
-export function optimizeModularCluster(layer: FacadeLayer): boolean {
-  if (!hasBoundary(layer) || !layer.grids.some((g) => g) || layer.modularCluster) return false;
-  layer.modularCluster = true;
-  return true;
-}
-
-/**
- * STEPPED-EDGE rationalization (Optimize → "Stepped Edge" / pixelated). Switch the layer into stepped mode:
- * the smooth diagonal is quantized to a stair-step built from whole cells (every cell ≥ half inside is kept
- * as a full rectangle, the rest dropped), so 100% of panels are one identical mass-produced type. A no-op
- * (returns false) when there's no lattice yet, or when the mode is already on (undo turns it back off).
- */
-export function optimizeSteppedEdge(layer: FacadeLayer): boolean {
-  if (!hasBoundary(layer) || !layer.grids.some((g) => g) || layer.steppedEdge) return false;
-  layer.steppedEdge = true;
-  return true;
+export function optimizeBorder(
+  layer: FacadeLayer,
+  border: number,
+  strategy: OptimizeStrategy | null,
+): boolean {
+  if (!hasBoundary(layer) || border < 0 || border >= layer.borders.length) return false;
+  if (!layer.grids[border]) return false; // nothing to rationalize until the shape is split
+  if (strategy === 'edge-normalize') return normalizeBorderToGrid(layer, border);
+  const next = strategy === borderMode(layer, border) ? null : strategy;
+  return setBorderMode(layer, border, next);
 }
 
 /** Move a border corner to a world point — deforms that trim quad (the fixed cells clip, never stretch). */
+/**
+ * Rotate a border's outline by `deg` about the centre of `orig`'s bounding box, writing the result over
+ * `layer.borders[border]`. Takes the ORIGINAL polygon rather than reading the live one so a drag applies an
+ * absolute angle each frame — rotating the live outline would compound rounding error over the gesture.
+ *
+ * Only the outline turns. The cell lattice stays axis-aligned by design (the border is a clipping mask, not
+ * a frame), so a rotated boundary re-slices the panels underneath it exactly as a dragged corner does.
+ */
+export function rotateBorder(layer: FacadeLayer, border: number, orig: Vec2[], deg: number): void {
+  if (!layer.borders[border] || orig.length < 3) return;
+  const bb = polyBBox(orig);
+  const cx = bb.x + bb.w / 2;
+  const cy = bb.y + bb.h / 2;
+  const rad = (deg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  layer.borders[border] = orig.map((p) => {
+    const dx = p.x - cx;
+    const dy = p.y - cy;
+    return { x: cx + dx * cos - dy * sin, y: cy + dx * sin + dy * cos };
+  });
+}
+
 export function moveBorderCorner(layer: FacadeLayer, border: number, corner: number, pt: Vec2): void {
-  if (corner < 0 || corner > 3) return;
   const poly = layer.borders[border];
   if (!poly) return;
+  // Bound by the polygon's OWN length, not a quad's. A border is a quad only until it is united or
+  // subtracted; after a boolean it has as many vertices as the result left it, and every one of them is
+  // drawn as a grab handle — so every one has to move.
+  if (corner < 0 || corner >= poly.length) return;
   poly[corner] = { x: pt.x, y: pt.y };
 }
 
-/** A border edge hit: which border (index into `borders`) and which side of its quad. */
+/**
+ * A border edge hit: which border (index into `borders`), and the INDEX of the edge that runs from
+ * `poly[edge]` to `poly[edge + 1]`. An index rather than a compass face because a border is only a quad
+ * until it is united or subtracted — after a boolean the outline is an N-gon, and every one of its edges
+ * has to stay grabbable. `a`/`b` are that edge's endpoints, so callers can derive its direction.
+ */
 export interface BorderEdgeHit {
   border: number;
-  edge: BoundaryEdge;
+  edge: number;
+  a: Vec2;
+  b: Vec2;
 }
 
 /** Which outer border edge a world point is near (within `tol`), across all borders, or null. */
@@ -1418,18 +1879,15 @@ export function hitBoundaryEdge(layer: FacadeLayer, pt: Vec2, tol: number): Bord
   let best: BorderEdgeHit | null = null;
   let bestDist = tol;
   borderPolygons(layer).forEach((poly, b) => {
-    if (poly.length < 4) return;
-    const edges: { edge: BoundaryEdge; a: Vec2; bp: Vec2 }[] = [
-      { edge: 'n', a: poly[0], bp: poly[1] }, // NW→NE
-      { edge: 'e', a: poly[1], bp: poly[2] }, // NE→SE
-      { edge: 's', a: poly[2], bp: poly[3] }, // SE→SW
-      { edge: 'w', a: poly[3], bp: poly[0] }, // SW→NW
-    ];
-    for (const { edge, a, bp } of edges) {
+    if (poly.length < 3) return;
+    // Walk EVERY edge, not just the first four: a boolean result has as many as the union/difference left.
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i];
+      const bp = poly[(i + 1) % poly.length];
       const d = distToSegment(pt, a, bp);
       if (d < bestDist) {
         bestDist = d;
-        best = { border: b, edge };
+        best = { border: b, edge: i, a, b: bp };
       }
     }
   });
@@ -1446,6 +1904,29 @@ export function hitBoundaryEdge(layer: FacadeLayer, pt: Vec2, tol: number): Bord
 
 /** Smallest gap (as a fraction of the pitch) a line/segment keeps from its neighbour. */
 const MIN_LINE_GAP_FRAC = 0.15;
+
+/**
+ * Every lattice line of a split border, in world coordinates — the column x's and the row y's, OUTER edges
+ * included, so consecutive entries bracket one cell.
+ *
+ * Exists for the guided tour, which has to aim a real drag AT a mullion: the lattice is a fixed pitch plus
+ * per-line overrides, so its live positions can only be read back, never predicted from the cols × rows the
+ * split was asked for. Null until the border has been split.
+ */
+export function gridLinePositions(
+  layer: FacadeLayer,
+  border: number,
+): { x: number[]; y: number[] } | null {
+  const g = layer.grids[border];
+  if (!g) return null;
+  const range = baseCellRange(layer, border);
+  if (!range) return null;
+  const x: number[] = [];
+  const y: number[] = [];
+  for (let i = range.iMin; i <= range.iMax + 1; i++) x.push(lineX(g, i));
+  for (let j = range.jMin; j <= range.jMax + 1; j++) y.push(lineY(g, j));
+  return { x, y };
+}
 
 /** The nearest inner grid line — a lattice column/row divider OR an extra (duplicated) line — within `tol`. */
 export function hitAnyLine(layer: FacadeLayer, pt: Vec2, tol: number): LineHandle | null {

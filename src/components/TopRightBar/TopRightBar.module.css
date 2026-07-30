@@ -15,7 +15,7 @@
 }
 
 /* Shared pill surface for both controls. */
-.export,
+.demo,
 .signOut {
   background: #ffffff;
   border: 1px solid rgba(15, 23, 42, 0.06);
@@ -29,20 +29,20 @@
     background 120ms ease;
 }
 
-.export:hover,
+.demo:hover,
 .signOut:hover {
   color: #18181b;
   background: #e9e9ec;
 }
 
-.export:focus-visible,
+.demo:focus-visible,
 .signOut:focus-visible {
   outline: 2px solid #6ea8fe;
   outline-offset: 1px;
 }
 
-/* "Export" text pill — matches the TopBar text pills. */
-.export {
+/* "Demo" text pill — matches the TopBar text pills. */
+.demo {
   display: flex;
   align-items: center;
   height: 40px;

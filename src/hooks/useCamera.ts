@@ -51,8 +51,15 @@ export function useCamera(
     onChangeRef.current = onChange;
   });
 
+  // Mutated in place rather than replaced: the draw loop and every gesture read `.current` fresh, but a
+  // running camera tween holds the object it started with — swapping in a new one would leave that tween
+  // animating an orphan while the view sat frozen on the reset values.
   const reset = useCallback(() => {
-    cameraRef.current = createInitialCamera();
+    const next = createInitialCamera();
+    const cam = cameraRef.current;
+    cam.x = next.x;
+    cam.y = next.y;
+    cam.scale = next.scale;
     onChangeRef.current();
   }, []);
 

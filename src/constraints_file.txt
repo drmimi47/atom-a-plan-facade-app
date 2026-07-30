@@ -1,4 +1,5 @@
-# Adjust constraints or add new ones
+# Editable rules that every room is checked against. Anything that breaks a rule is flagged on the canvas. Use the wand above the Constraints button to automatically fix violations one at a time.
+
 Minimum wall thickness 4"
 Maximum wall thickness 36"
 Every room must maintain area ≥ 36 sq ft

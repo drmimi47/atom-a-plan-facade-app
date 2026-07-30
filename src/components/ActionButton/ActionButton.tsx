@@ -62,7 +62,13 @@ export function ActionButton({ canvasRef, facade = false, onArmFacadeBorder }: A
     // In Facade mode, arm the Layers tool so the placement this gesture starts commits a trim border.
     if (facade) onArmFacadeBorder?.();
     gesture.current = { active: true, dragging: false, startX: e.clientX, startY: e.clientY };
-    e.currentTarget.setPointerCapture(e.pointerId);
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // No such active pointer — the case for a synthesized gesture (the guided tour drags this cube).
+      // Capture is an optimisation here, not the mechanism: the move/up handlers work off coordinates, so
+      // losing it costs nothing, whereas letting it throw would abort the gesture on its first event.
+    }
   };
 
   const handlePointerMove = (e: PointerEvent<HTMLButtonElement>) => {
@@ -116,6 +122,7 @@ export function ActionButton({ canvasRef, facade = false, onArmFacadeBorder }: A
       type="button"
       className={styles.button}
       aria-label="Space"
+      data-demo="cube"
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}

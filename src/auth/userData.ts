@@ -3,8 +3,13 @@ import { db, firebaseEnabled } from './firebase';
 
 /** A signed-in user's saved app state, stored at Firestore `users/{uid}`. */
 export interface UserData {
-  /** The raw constraints text the user last saved (seeds the Constraints editor). */
+  /** The raw PLAN constraints text the user last saved (seeds the Constraints editor in Plan mode). */
   constraintsText?: string;
+  /**
+   * The raw FACADE constraints text the user last saved. Stored separately because the two rule sets are
+   * separate: each mode edits, parses, and enforces only its own, so they must round-trip independently.
+   */
+  facadeConstraintsText?: string;
   /** The user's room-prediction adjacency table (overrides the live ADJACENCY on load). */
   adjacency?: Record<string, Record<string, number>>;
   /** Last write time (ms epoch), for reference/debugging. */
@@ -27,6 +32,23 @@ export async function saveUserConstraints(uid: string, constraintsText: string):
   if (!firebaseEnabled || !db) return;
   try {
     await setDoc(doc(db, 'users', uid), { constraintsText, updatedAt: Date.now() }, { merge: true });
+  } catch {
+    // best-effort; the edit still applies locally this session
+  }
+}
+
+/** Merge-save the user's FACADE constraints text. No-op when Firebase is disabled. */
+export async function saveUserFacadeConstraints(
+  uid: string,
+  facadeConstraintsText: string,
+): Promise<void> {
+  if (!firebaseEnabled || !db) return;
+  try {
+    await setDoc(
+      doc(db, 'users', uid),
+      { facadeConstraintsText, updatedAt: Date.now() },
+      { merge: true },
+    );
   } catch {
     // best-effort; the edit still applies locally this session
   }

@@ -1,0 +1,13 @@
+# Editable rules that the facade is checked against. Anything that breaks a rule is flagged on the canvas. Panel rules flag the offending panels; the whole-elevation rules below wash the canvas until the design is back in range.
+
+Maximum panel width 6'
+Minimum panel width 1'
+Maximum panel height 12'
+Minimum panel height 1'
+Maximum panel area 60 sq ft
+Minimum window-to-wall ratio 15%
+Maximum window-to-wall ratio 60%
+Maximum U-value 0.45
+Minimum standardization 50%
+Maximum panel count 600
+Maximum cost 95 per sq ft

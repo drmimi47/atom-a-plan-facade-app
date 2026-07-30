@@ -1,0 +1,457 @@
+/* Guided-tour card, docked top-CENTRE and sharing the top row with the pill clusters: it starts on the same
+   16px line as "Mode: Plan" on the left and "Demo" on the right, so the three read as one band of chrome.
+   The nav pill owns the bottom centre and the floating panel bar hangs under whatever is selected — the top
+   is the one strip a tour can occupy without covering the thing it is pointing at. Wide and short rather
+   than tall and narrow, so it takes a band off the top instead of a column out of the middle.
+
+   Sharing that row means the card has neighbours, and the two variables below are what it keeps off:
+
+     • LEFT — the top-left pill row (Mode › title › Save › +), which ends at 476px in the wider of the two
+       modes ("Mode: Facade") with the tour's own "Untitled Project" title.
+     • RIGHT — the Display Toggles panel, 300px + margin down the right edge in Facade mode. It starts 50px
+       lower than this card, but the card is far taller than that, so the overlap is real.
+
+   Between them the card is viewport-centred wherever that fits (a wide window), and slides just far enough
+   inboard to clear a neighbour when it doesn't. No backdrop, because the user is meant to keep working
+   through it. */
+.card {
+  --edge-left: 496px;
+  --edge-right: 336px;
+  /* Widest that still fits between both neighbours, capped where the type stops reading well. */
+  --card-w: clamp(340px, calc(100vw - var(--edge-left) - var(--edge-right)), 620px);
+
+  position: fixed;
+  top: 16px;
+  left: clamp(
+    var(--edge-left),
+    calc(50vw - var(--card-w) / 2),
+    calc(100vw - var(--edge-right) - var(--card-w))
+  );
+  z-index: 46;
+
+  width: var(--card-w);
+  padding: 12px 18px 11px;
+
+  background: #ffffff;
+  border: 1px solid rgba(15, 23, 42, 0.14);
+  border-radius: 16px;
+  box-shadow: 0 22px 60px rgba(15, 23, 42, 0.28);
+
+  font-family: inherit;
+  color: #18181b;
+  animation: rise 180ms ease-out;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Three fixed things cannot share one line for ever: the pill row, this card and the Display Toggles panel
+   need ~1240px between them before the card is squeezed narrow enough to go tall. Under that it gives up the
+   shared row and drops just below the pills, where it only has the panel to clear. */
+@media (max-width: 1240px) {
+  .card {
+    --card-w: clamp(380px, calc(100vw - 660px), 620px);
+    top: 66px;
+    left: clamp(
+      16px,
+      calc(50vw - var(--card-w) / 2),
+      calc(100vw - var(--edge-right) - var(--card-w))
+    );
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card {
+    animation: none;
+  }
+}
+
+.close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 999px;
+  background: none;
+  cursor: pointer;
+  font-size: 20px;
+  line-height: 1;
+  color: #a1a1aa;
+  transition:
+    color 120ms ease,
+    background 120ms ease;
+}
+
+.close:hover {
+  color: #18181b;
+  background: #f1f1f3;
+}
+
+/* ---- Shared type ---------------------------------------------------- */
+
+.eyebrow {
+  display: block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #a1a1aa;
+}
+
+.title {
+  margin: 0;
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+  color: #18181b;
+}
+
+.chooserTitle {
+  margin: 3px 0 0;
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+  color: #18181b;
+}
+
+.head,
+.chooserHead {
+  padding-right: 28px; /* clear the × */
+}
+
+.body {
+  margin: 7px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #52525b;
+}
+
+/* The hand-off: this step wants the user to do something. */
+.tryIt {
+  margin: 9px 0 0;
+  padding: 7px 11px;
+  background: #eef2ff;
+  border-radius: 9px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #1e3a8a;
+}
+
+.tryItTag {
+  display: inline-block;
+  margin-right: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #2563eb;
+}
+
+/* ---- Footer: progress dots + Back/Next ------------------------------ */
+
+.foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+/* Progress cluster: which tour and how far along, then the dots. Both answer "where am I", and pairing them
+   here is what lets the head be a single title line. */
+.progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.dots {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.18);
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    width 140ms ease;
+}
+
+.dot:hover:not(:disabled) {
+  background: rgba(15, 23, 42, 0.38);
+}
+
+/* Held for the few frames a fast-forward takes to drain. */
+.dot:disabled,
+.primary:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.dotOn,
+.dotOn:hover {
+  width: 18px;
+  background: #18181b;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Step indicator, immediately left of Back. Fixed box so swapping the ring for the tick can't shuffle the
+   buttons beside it. */
+.status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin-right: 2px;
+  color: #2563eb;
+}
+
+/* Still playing: a ring with one lit quarter, turning. */
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(37, 99, 235, 0.2);
+  border-top-color: #2563eb;
+  border-radius: 999px;
+  animation: spin 700ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Done: the same blue, resolved into a tick. Fades rather than pops, so the change registers. */
+.done {
+  animation: settle 200ms ease-out;
+}
+
+@keyframes settle {
+  from {
+    opacity: 0;
+    transform: scale(0.7);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* The indicator carries meaning, so it keeps turning under reduced motion — just slowly enough not to
+   be the thing you watch. */
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2.4s;
+  }
+
+  .done {
+    animation: none;
+  }
+}
+
+.ghost,
+.primary {
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border-radius: 999px;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    opacity 120ms ease;
+}
+
+.ghost {
+  padding: 7px 14px;
+  color: #52525b;
+  background: rgba(15, 23, 42, 0.05);
+}
+
+.ghost:hover:not(:disabled) {
+  color: #18181b;
+  background: rgba(15, 23, 42, 0.1);
+}
+
+.ghost:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.primary {
+  padding: 7px 20px;
+  color: #ffffff;
+  background: #18181b;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.2);
+}
+
+.primary:hover {
+  background: #000000;
+}
+
+.ghost:focus-visible,
+.primary:focus-visible,
+.choice:focus-visible,
+.dot:focus-visible {
+  outline: 2px solid #6ea8fe;
+  outline-offset: 2px;
+}
+
+/* ---- Mode chooser --------------------------------------------------- */
+
+/* Side by side, sharing the width evenly — the card is wide enough that stacking them would make the
+   chooser taller than any step it introduces. */
+.choices {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.choice {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 11px 13px;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  border-radius: 12px;
+  background: #ffffff;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
+}
+
+.choice:hover {
+  background: #eef2ff;
+  border-color: #2563eb;
+}
+
+.choiceName {
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  color: #18181b;
+}
+
+.choice:hover .choiceName {
+  color: #2563eb;
+}
+
+.choiceBlurb {
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #71717a;
+}
+
+.choiceMeta {
+  margin-top: 2px;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #a1a1aa;
+}
+
+.escHint {
+  margin: 10px 0 0;
+  font-size: 11px;
+  color: #a1a1aa;
+}
+
+.kbd {
+  padding: 1px 5px;
+  border: 1px solid rgba(15, 23, 42, 0.16);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: #fafafa;
+  font-family: inherit;
+  font-size: 10px;
+  color: #52525b;
+}
+
+/* ---- The tour's synthetic cursor ------------------------------------ */
+
+/* Above every panel (the tour clicks controls that sit at z-index 45) and never interactive — the REAL
+   pointer must still reach everything underneath, since half the steps hand the gesture to the user. */
+.cursor {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 60;
+  pointer-events: none;
+  filter: drop-shadow(0 2px 4px rgba(15, 23, 42, 0.35));
+  will-change: transform;
+}
+
+/* Click feedback: a ring that expands and fades from the cursor tip. Keyed on the press counter in the
+   component, so re-clicking the same spot restarts it rather than showing nothing. */
+.ripple {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  border: 2px solid #2563eb;
+  border-radius: 999px;
+  opacity: 0;
+  animation: press 460ms ease-out;
+}
+
+@keyframes press {
+  from {
+    opacity: 0.9;
+    transform: scale(0.4);
+  }
+  to {
+    opacity: 0;
+    transform: scale(3.2);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ripple {
+    animation-duration: 1ms;
+  }
+}

@@ -21,12 +21,12 @@ import type {
 import {
   GRID_THEME,
   SHAPE_THEME,
-  MAX_SCALE,
   DEFAULT_SQUARE_SCREEN_SIZE,
   DEFAULT_WALL_WORLD,
   WORLD_UNITS_PER_FOOT,
   MIN_WALL_WORLD,
   MAX_DEVICE_PIXEL_RATIO,
+  MAX_SCALE,
   MARQUEE_FILL,
   MARQUEE_STROKE,
   worldUnitsPerUnit,
@@ -39,6 +39,7 @@ import {
   defaultWalls,
   boundingBoxLocal,
   adjacentCopyOffset,
+  footprintWorld,
   shapeAreaInUnit,
   shapeGrossAreaInUnit,
   withEdgeThickness,
@@ -63,6 +64,7 @@ import { computePanelTypes, type PanelType } from '../../facade/standardize';
 import { drawPartition } from '../../canvas/partitionDraw';
 import {
   newDoc,
+  cellKeysInRect,
   cloneDoc as clonePartitionDoc,
   activeLayer as partitionActiveLayer,
   hasBoundary as partitionHasBoundary,
@@ -70,24 +72,35 @@ import {
   selectLayer as selectPartitionLayer,
   splitCell as splitPartitionCell,
   placeBorder as placePartitionBorder,
+  polyBBox as partitionPolyBBox,
+  gridLinePositions as partitionGridLines,
   resizeBorderExtent,
+  moveLatticePreservingFrames,
   summarizeDoc,
   panelStats as partitionPanelStatsOf,
-  optimizeEdgeNormalize,
-  optimizeEdgeProfile,
-  optimizeModularCluster,
-  optimizeSteppedEdge,
+  optimizeBorder,
   borderBooleanHoverAt,
   representativeCell,
-  cellGroupAt,
-  seedGroupFrames,
-  groupFrame,
-  setGroupPanelKind,
+  cellKeyAt,
+  cellRectsOf,
+  cellRefRect as partitionCellRefRect,
+  selectedCellsExtent,
+  selectedBordersExtent,
+  seedPanelFrames,
+  panelFrameAt,
+  copyBorders,
+  pasteBorders,
+  removeBorders,
+  setPanelKind,
+  facadeMetrics as facadeMetricsOf,
+  type BorderSnapshot,
+  type FacadeMetrics,
   type CellRef,
   type PanelKind,
   type FacadeDoc,
   type FacadeSummary,
   type OptimizeStrategy,
+  type PanelMode,
   type Rect,
   type SegmentRef,
 } from '../../facade/partition';
@@ -110,10 +123,17 @@ import {
   type FixResult,
 } from '../../constraints/autofix';
 import type { PredictionOption } from '../../rooms/roomAdjacency';
-import { screenToWorld } from '../../canvas/coords';
-import type { Constraints } from '../../../backend/types';
-import { hasAnyConstraint } from '../../../backend/types';
+import type { ProjectSnapshot, WorkspaceState } from '../../projects';
+import { screenToWorld, worldToScreen } from '../../canvas/coords';
+import type { Constraints, FacadeConstraints } from '../../../backend/types';
+import {
+  EMPTY_CONSTRAINTS,
+  EMPTY_FACADE_CONSTRAINTS,
+  hasAnyConstraint,
+  hasAnyFacadeConstraint,
+} from '../../../backend/types';
 import { findViolations, type ShapeViolations } from '../../../backend/violations';
+import { findFacadeViolations, NO_FACADE_VIOLATIONS } from '../../../backend/facadeViolations';
 import { worsensConstraints } from '../../../backend/clamp';
 import { useCamera } from '../../hooks/useCamera';
 import { useCanvasInteractions } from '../../hooks/useCanvasInteractions';
@@ -133,6 +153,22 @@ export interface SelectedPanelInfo {
   heightFt: number;
   /** The visible mullion/joint band width in inches (its uniform wall thickness). */
   bandIn: number;
+}
+
+/**
+ * A restorable copy of the canvas, for the guided tour's Back button. Opaque to its callers — they hold one
+ * and hand it back; only {@link CanvasHandle.demoRestore} knows what is in it.
+ */
+export interface DemoSnapshot {
+  shapes: Square[];
+  footprints: Footprint[];
+  partition: FacadeDoc;
+  selection: string[];
+  cellSel: string[];
+  borderSel: number[];
+  entered: number | null;
+  frameEdit: { keys: string[]; rect: Rect; hoverSide: 'n' | 'e' | 's' | 'w' | 'b' | null; allSides: boolean } | null;
+  camera: { x: number; y: number; scale: number };
 }
 
 export interface CanvasHandle {
@@ -166,6 +202,17 @@ export interface CanvasHandle {
    * disarms once one footprint is drawn (or the drag is cancelled).
    */
   armFootprintDraw(): void;
+  /**
+   * Serialise the whole drawing — BOTH mode workspaces (the live one plus the stashed
+   * other), the facade partition, and the active unit — as plain data for the Saved list.
+   */
+  snapshotProject(): ProjectSnapshot;
+  /**
+   * Replace the whole drawing with a saved snapshot. The current mode decides which
+   * workspace goes live; the other is stashed. History restarts from the loaded state, so
+   * undo can't reach back past the load.
+   */
+  loadProject(snapshot: ProjectSnapshot): void;
   /**
    * Run a smart-find search over the current shapes and highlight the matches in
    * accent blue (rooms washed, matched wall bands filled). Returns the match count.
@@ -204,8 +251,10 @@ export interface CanvasHandle {
   splitCell(ref: CellRef, cols: number, rows: number): void;
   /** Layers tool: total visible panels + how many are UNIQUE shapes in the active layer (the Optimize metric). */
   partitionPanelStats(): { total: number; unique: number };
+  /** Facade mode: the live engineering readouts for the active layer (drives the bottom statistics). */
+  facadeMetrics(): FacadeMetrics;
   /** Layers tool: rationalize the active layer with the chosen strategy to reduce unique panels (one undo step). */
-  optimizePartition(strategy: OptimizeStrategy): void;
+  optimizePartition(border: number, strategy: OptimizeStrategy): void;
   /**
    * Layers tool: begin an Edit-a-panel session on the currently selected panel group(s) — zoom to a
    * representative panel and auto-seed a uniform frame on the group. Returns the edited group keys, or null
@@ -229,15 +278,126 @@ export interface CanvasHandle {
   fixSkip(): FixResult;
   /** End the session: clear the preview and ease the camera back to where it started. */
   fixCancel(): void;
+  /* ---- Scripted-walkthrough primitives (the guided Demo) ---------------------------------------- */
+  /**
+   * Bounding box of the first trim border, or null when there is none.
+   *
+   * The tour needs this because a dropped border is sized in SCREEN pixels — its world extent depends on
+   * the camera at the moment of the drop, so the script cannot know it in advance and has to read it back
+   * before it can aim a drag at an edge or a corner.
+   */
+  demoBorderRect(): Rect | null;
+  /**
+   * World positions of the first border's lattice lines (outer edges included), or null before it is split.
+   *
+   * The tour drags REAL mullions, and a lattice carries per-line overrides the moment one is moved — so
+   * every grab point after the first has to be read back rather than derived from the cols × rows.
+   */
+  demoGridLines(): { x: number[]; y: number[] } | null;
+  /**
+   * The rects of the panels currently selected — the live ones, not the lattice cells they came from.
+   *
+   * The lattice is a bounding box: on a cut elevation whole rows and columns of it exist only where the
+   * boundary has not eaten them, so a point derived from the lattice can easily land where there is no
+   * panel at all. Anything the tour has to AIM at (a mullion face, say) has to come from here instead.
+   */
+  demoSelectedPanelRects(): Rect[];
+  /**
+   * Every Plan-mode room as the tour needs to aim at one: its id, whether it is selected, whether it is
+   * currently flagged for a constraint violation, and its interior and outer (wall) world bounds.
+   *
+   * The two rects are what make a Plan gesture aimable at all, because in Plan mode WHERE you click is
+   * the whole operation: a press inside both rooms' interiors unites them, a press on one room's wall
+   * band over the other's interior subtracts. Those two regions are one wall thickness apart, so the
+   * tour has to measure the real geometry rather than predict it — a dropped room can be nudged off its
+   * drop point by wall snapping on the way down, and every click after that would then miss.
+   *
+   * `corners` and `thickness` are what let it keep aiming after a room has been RESHAPED. A bounding box
+   * describes a rectangle and nothing else: move one vertex and two of the walls run at an angle, so the
+   * midpoint of a wall — and the band a thickness drag has to be inside — can only be found from the
+   * polygon itself.
+   */
+  demoRoomRects(): {
+    id: string;
+    selected: boolean;
+    flagged: boolean;
+    inner: Rect;
+    outer: Rect;
+    /** Interior corners in world space; edge `i` runs from corner `i` to corner `i + 1`. */
+    corners: { x: number; y: number }[];
+    /** Each edge's wall thickness in world units, indexed like {@link corners}. */
+    thickness: number[];
+  }[];
+  /** Select every panel overlapping a world rect (what a marquee sweep does). Returns how many. */
+  selectPanelsInWorldRect(rect: Rect): number;
+  /**
+   * Ease the camera to frame a world rect. `padPx` is the screen margin; `fill` (0–1) then backs the zoom
+   * off that best fit, so the subject sits in its surroundings instead of filling the viewport edge to
+   * edge — which reads as being shoved into the shape rather than shown it.
+   *
+   * `insets` overrides that margin per side, and the rect is centred in what's LEFT — which is the only way
+   * to frame around the fixed furniture. The floating panel bar hangs under the selection and the nav pill
+   * owns the bottom of the screen, so a subject centred on the raw viewport pushes its own toolbar off it.
+   */
+  focusWorldRect(
+    rect: Rect,
+    opts?: {
+      padPx?: number;
+      fill?: number;
+      insets?: { top?: number; right?: number; bottom?: number; left?: number };
+      /** Land the camera THIS frame instead of easing. Used when a tour step is being skipped to its end. */
+      instant?: boolean;
+    },
+  ): void;
+  /**
+   * Everything the canvas holds that a tour step can change, deep-copied.
+   *
+   * This is what makes stepping BACKWARDS in the tour instant: the walkthrough is cumulative, so returning
+   * to an earlier step used to mean replaying every gesture from an empty canvas. Keeping the end state of
+   * each step lets it be put back exactly, in one frame, with nothing re-enacted.
+   */
+  demoSnapshot(): DemoSnapshot;
+  /** Put a {@link demoSnapshot} back, camera included, and repaint. */
+  demoRestore(snap: DemoSnapshot): void;
+  /**
+   * Drop every selection — panels, borders, shapes — and close any panel-Edit session, leaving the drawing
+   * itself untouched. What the tour ends on, so the last thing shown is the elevation rather than the
+   * highlight of whatever the last gesture happened to sweep up.
+   */
+  demoDeselect(): void;
+  /**
+   * Clear the canvas (both workspaces' shapes and the facade partition) AND recentre the camera — the demo
+   * starts from empty, at 100%, with the world origin in the middle of the viewport.
+   *
+   * The camera reset is not cosmetic. The cube drops a fixed SCREEN square, so the world size of everything
+   * the tour builds is decided by the zoom at the moment of the drop; without this, replaying the tour from
+   * a zoomed-in step would build a shape smaller each time and eventually need a zoom past MAX_SCALE to
+   * frame it.
+   */
+  resetForDemo(): void;
+  /** A world point in VIEWPORT coordinates, so an overlay can point at something on the canvas. */
+  worldToClient(world: { x: number; y: number }): { x: number; y: number };
 }
+
+/** Screen-px gap between a panel's bottom edge and the floating menu hanging under it. */
+const CELL_MENU_GAP = 8;
 
 /** Default mullion width (inches) auto-seeded onto a group's frame when an Edit-a-panel session starts. */
 const DEFAULT_PANEL_FRAME_IN = 2;
 
 interface InfiniteCanvasProps {
   gridSize: number;
-  /** Active global constraints; rooms breaking a rule are flagged bright green. */
+  /**
+   * Plan-mode room constraints; rooms breaking a rule are flagged yellow. MODE-SCOPED: these are ignored
+   * entirely in Facade mode — a curtain wall isn't judged on room areas — so they neither flag a facade
+   * assembly nor clamp a drag there. {@link facadeConstraints} takes over instead.
+   */
   constraints: Constraints;
+  /**
+   * Facade-mode constraints (panel sizes, WWR, U-value, standardization, cost). Active ONLY in Facade
+   * mode, and only against the Layers-tool partition — the two rule sets are never both in force.
+   */
+  facadeConstraints?: FacadeConstraints;
   /** When on, draws dev overlays (green centre numbers, cyan overlap region). */
   debug?: boolean;
   /** When on (the Analyze view), every shape is ghosted — the dev overlays stay off. */
@@ -292,15 +452,19 @@ interface InfiniteCanvasProps {
   /**
    * Facade Layers tool (uniform sticky-cell partition). When active, the canvas edits the layer stack and
    * HIDES the rooms. `onPartitionChange` reports the live layer/cell summary for the top-center navigator;
-   * `onCellContextMenu` fires on a right-click over a cell to open the split menu.
+   * `onCellMenu` fires when a click over a cell should open (or close) that panel's floating menu.
    */
   layersActive?: boolean;
   /**
-   * Layers tool sub-mode. `true` (Border) = the trim boundary is editable (draw / move corners / stretch
-   * edges). `false` (Panels) = the border is locked and only the inner grid (lines, splits, panel groups)
-   * is editable. Defaults to Border.
+   * Live Assign-menu preview: while an option is hovered, the SELECTED panels render with that material
+   * instead of their own. Render-only — nothing is committed until the option is clicked.
    */
-  borderMode?: boolean;
+  kindPreview?: { kind: PanelKind | null } | null;
+  /**
+   * Live Optimize-menu preview: render `border` as `strategy` would leave it. Render-only — the strategy is
+   * committed only when the option is clicked.
+   */
+  optimizePreview?: { border: number; strategy: OptimizeStrategy } | null;
   /** Material-ID (segmentation) view: paint each cell a flat contrasting colour. */
   idView?: boolean;
   /** Purely-visual drop shadow under the per-group frame bands (depth only). */
@@ -311,7 +475,19 @@ interface InfiniteCanvasProps {
    *  from the actual resulting partition (lattice tiled + clipped to the boundary). */
   splitPreview?: { ref: CellRef; cols: number; rows: number } | null;
   onPartitionChange?: (summary: FacadeSummary) => void;
-  onCellContextMenu?: (info: { screenX: number; screenY: number; ref: CellRef; rect: Rect | null }) => void;
+  /** Open (null = close) the floating menu for a panel. The cell REF is reported, not a screen point. */
+  onCellMenu?: (
+    info: { ref: CellRef; rect: Rect | null; subdivided: boolean; mode: PanelMode | null } | null,
+  ) => void;
+  /** The cell whose floating menu is open, so the canvas can keep publishing its live screen anchor. */
+  menuCell?: CellRef | null;
+  /**
+   * Live screen anchor (client px) for the open panel menu: the BOTTOM CENTRE of the current panel
+   * SELECTION — one panel's own rect, or the box enclosing several — so the bar sits under whatever is
+   * selected. Re-published on every scene draw, so the menu rides along as the panels are dragged, panned,
+   * or zoomed. Null once the selection and cell are both gone.
+   */
+  onCellMenuAnchorChange?: (anchor: { x: number; y: number } | null) => void;
   /** End the active Edit-a-panel session (a clean click outside the border / on another group acts as Done). */
   onExitFrameEdit?: () => void;
 }
@@ -344,6 +520,21 @@ function cloneShape(s: Square): Square {
     corners: s.corners?.map((p) => ({ ...p })),
     wallEdges: s.wallEdges?.slice(),
   };
+}
+
+/** Axis-aligned world bounds of a polygon ring (a footprint from {@link footprintWorld}). */
+function polyBounds(pts: { x: number; y: number }[]): Rect {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 }
 
 /** Deep-enough clone of the shapes for an immutable history snapshot. */
@@ -423,6 +614,7 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
     {
       gridSize,
       constraints,
+      facadeConstraints,
       debug,
       analyze,
       facade,
@@ -439,13 +631,16 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
       standardize,
       onPanelTypesChange,
       layersActive,
-      borderMode,
       idView,
       frameShadow,
       panelNumbers,
       splitPreview,
+      kindPreview,
+      optimizePreview,
       onPartitionChange,
-      onCellContextMenu,
+      onCellMenu,
+      menuCell,
+      onCellMenuAnchorChange,
       onExitFrameEdit,
     },
     ref,
@@ -498,12 +693,12 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
     } | null>(null);
     // Translucent ghost of the proposed fix for the room under review (render-only).
     const fixPreviewRef = useRef<{ shapeId: string; ghost: Square } | null>(null);
-    // Edit-a-panel session: the selected group keys being framed, the representative cell rect (camera focus +
-    // edge hit-testing), the camera to restore on exit, and the live hovered/dragged frame side.
+    // Edit-a-panel session: the selected panel keys being framed, the representative cell rect (camera focus
+    // + edge hit-testing), and the live hovered/dragged frame side. No camera is stored — Edit zooms IN and
+    // leaves the view there; ending the session doesn't pull the camera back out from under the user.
     const frameEditRef = useRef<{
       keys: string[];
       rect: Rect;
-      priorCamera: { x: number; y: number; scale: number };
       hoverSide: 'n' | 'e' | 's' | 'w' | 'b' | null;
       allSides: boolean;
     } | null>(null);
@@ -585,11 +780,20 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
     // so they don't stack exactly on top of each other.
     const clipboardRef = useRef<Square[]>([]);
     const pasteSeqRef = useRef(0);
+    // The Layers tool's own clipboard: whole trim borders (outline + lattice + panels), so the same
+    // copy/cut/paste keys work on facade borders the way they do on rooms. Kept separate from the room
+    // clipboard so switching tools never pastes the wrong kind of thing.
+    const borderClipboardRef = useRef<BorderSnapshot[]>([]);
+    const borderPasteSeqRef = useRef(0);
 
     // ---- Frame scheduler (per-layer dirty flags, one rAF) ------------------
     // Latest constraints, read by the scene draw (a ref so the imperative render
     // loop sees updates without this component re-rendering on every frame).
     const constraintsRef = useRef<Constraints>(constraints);
+    // The Facade-mode rule set, same deal. Only ever non-empty while Facade mode is active.
+    const facadeConstraintsRef = useRef<FacadeConstraints>(EMPTY_FACADE_CONSTRAINTS);
+    // Cell keys of the panels the facade rules currently flag — handed to drawPartition each frame.
+    const facadeFlaggedCellsRef = useRef<Set<string>>(new Set());
     // Debug-overlay flag (green centre numbers + cyan overlap), read by the draw.
     const debugRef = useRef(debug);
     // Analyze view: ghost every shape (no dev overlays), read by the scene draw.
@@ -599,17 +803,38 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
     // Facade Layers tool (uniform sticky-cell partition): active flag, the layer-stack document, the live
     // boundary-draw preview rect, and a key to dedupe summary reports.
     const layersActiveRef = useRef(layersActive);
-    // Border (true) vs Panels (false) sub-mode of the Layers tool. Defaults to Border.
-    const borderModeRef = useRef(borderMode ?? true);
+    // The border the user has double-clicked INTO (null = shape level). Outside it a border is an object
+    // to select and drag; inside it the pointer edits that border's panels.
+    const partitionEnteredRef = useRef<number | null>(null);
+    // Hovered Assign option (render-only material preview on the selection), read by the scene draw.
+    const kindPreviewRef = useRef<{ kind: PanelKind | null } | null>(kindPreview ?? null);
+    // Hovered Optimize option (render-only repanelization preview), read by the scene draw.
+    const optimizePreviewRef = useRef<{ border: number; strategy: OptimizeStrategy } | null>(
+      optimizePreview ?? null,
+    );
+    // Live edge-plus duplicate preview on a border (ghost copies under the cursor); null when idle.
+    const partitionPlusRef = useRef<{
+      border: number;
+      dx: number;
+      dy: number;
+      count: number;
+    } | null>(null);
     const partitionDocRef = useRef<FacadeDoc>(newDoc());
     const partitionSelSegRef = useRef<SegmentRef | null>(null);
-    const partitionGroupSelRef = useRef<Set<string>>(new Set());
+    // Selected panels, as per-CELL keys (see `cellKey`). Clicking a panel expands its whole material group
+    // into this set; a rubber-band sweep adds only the cells it covered. Group-level operations (assign
+    // material, Edit-a-panel) map back with `groupKeysOfCells`.
+    const partitionCellSelRef = useRef<Set<string>>(new Set());
     // Borders picked (shift-click, Border mode) for a boolean unite/difference op, in selection order.
     const partitionBorderSelRef = useRef<Set<number>>(new Set());
     const idViewRef = useRef(idView);
     const frameShadowRef = useRef(frameShadow);
     const panelNumbersRef = useRef(panelNumbers);
     const splitPreviewRef = useRef(splitPreview);
+    // The cell whose floating menu is open, plus the last anchor published for it (rounded to whole px so
+    // an idle frame never re-fires). Read by the scene draw, which is what keeps the menu glued to the panel.
+    const menuCellRef = useRef<CellRef | null>(menuCell ?? null);
+    const lastMenuAnchorRef = useRef<string>('\0');
     const lastPartitionKeyRef = useRef('');
     // Standardization view (Analyze popup open): colour panels by type + type-group click-select.
     const standardizeRef = useRef(standardize);
@@ -655,10 +880,23 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
     const requestAll = useCallback(() => requestDraw('all'), [requestDraw]);
 
     // A new/changed constraint set re-flags every shape on the next frame.
+    //
+    // MODE SCOPING happens here, once, rather than at each of the half-dozen call sites downstream: in
+    // Facade mode the room rules are swapped for an EMPTY set, so every consumer that reads this ref — the
+    // per-room violation flags, the drag clamp in `worsensConstraints`, the global budget wash, the fix
+    // wand — goes quiet together. There is no path by which a Plan rule can act on a facade.
     useEffect(() => {
-      constraintsRef.current = constraints;
+      constraintsRef.current = facade ? EMPTY_CONSTRAINTS : constraints;
       requestDraw('scene');
-    }, [constraints, requestDraw]);
+    }, [constraints, facade, requestDraw]);
+
+    // ...and the mirror image: the facade rules apply only in Facade mode.
+    useEffect(() => {
+      facadeConstraintsRef.current = facade
+        ? facadeConstraints ?? EMPTY_FACADE_CONSTRAINTS
+        : EMPTY_FACADE_CONSTRAINTS;
+      requestDraw('scene');
+    }, [facadeConstraints, facade, requestDraw]);
 
     // Toggling Debug shows/hides the dev overlays on the next frame.
     useEffect(() => {
@@ -686,7 +924,8 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
 
     // Switching Plan ⇄ Facade swaps to that mode's own workspace: stash the outgoing shapes,
     // restore the incoming ones (empty the first time, so Facade starts cleared). Undo history is
-    // reset to the restored workspace (no cross-mode undo). The redraw re-emits stats.
+    // reset to the restored workspace (no cross-mode undo). Both layers repaint synchronously so
+    // the swap is on screen the moment it happens, and the redraw re-emits stats.
     useEffect(() => {
       facadeRef.current = facade;
       const isFacade = !!facade;
@@ -715,8 +954,24 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
         },
       };
       prevFacadeRef.current = isFacade;
-      requestDraw('all');
-    }, [facade, requestDraw]);
+      // These dedupe the React-side reports against the LAST workspace's values. The
+      // incoming workspace can coincidentally match (both modes empty, both one shape
+      // selected), which would swallow the report and leave the panels describing the
+      // workspace we just left. Reset them so the redraw below re-emits unconditionally.
+      lastStatsKeyRef.current = '';
+      lastSelCountRef.current = -1;
+      lastSelPanelKeyRef.current = '\0';
+      lastPanelTypesKeyRef.current = '';
+      lastPartitionKeyRef.current = '';
+      // Repaint NOW, not on the next queued frame. requestDraw only sets dirty flags when a
+      // frame is already in flight, and the swapped-in workspace has to be on screen the
+      // instant the mode flips — otherwise the canvas keeps showing the mode we just left
+      // (which reads as "Facade is empty") until some unrelated interaction forces a redraw.
+      dirtyGridRef.current = false;
+      dirtySceneRef.current = false;
+      drawGridRef.current();
+      drawSceneRef.current();
+    }, [facade]);
 
     // Toggling the Constraints "Visibility" eye shows/hides the yellow violation
     // highlights on the next frame (the count/superscript is unaffected).
@@ -725,7 +980,7 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
       requestDraw('scene');
     }, [showConstraintHighlights, requestDraw]);
 
-    const { cameraRef } = useCamera(sceneCanvasRef, requestAll);
+    const { cameraRef, reset: resetCamera } = useCamera(sceneCanvasRef, requestAll);
 
     // Entering/leaving the Layers tool just toggles the flag and redraws — the user draws the boundary
     // (no auto-seed). 'all' so the grid layer redraws too: it hides while the tool is on, restores when off.
@@ -733,12 +988,6 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
       layersActiveRef.current = layersActive;
       requestDraw('all');
     }, [layersActive, requestDraw]);
-
-    // Switching between Border and Panels sub-modes repaints the partition (hides/shows the corner handles).
-    useEffect(() => {
-      borderModeRef.current = borderMode ?? true;
-      requestDraw('scene');
-    }, [borderMode, requestDraw]);
 
     // Toggling the Material-ID view just repaints the partition scene.
     useEffect(() => {
@@ -757,6 +1006,26 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
       panelNumbersRef.current = panelNumbers;
       requestDraw('scene');
     }, [panelNumbers, requestDraw]);
+
+    // Hovering an Assign option repaints the selection in that material (and un-hovering restores it).
+    useEffect(() => {
+      kindPreviewRef.current = kindPreview ?? null;
+      requestDraw('scene');
+    }, [kindPreview, requestDraw]);
+
+    // Hovering an Optimize option repanelizes that border for the preview only.
+    useEffect(() => {
+      optimizePreviewRef.current = optimizePreview ?? null;
+      requestDraw('scene');
+    }, [optimizePreview, requestDraw]);
+
+    // Opening/closing the panel menu: reset the dedupe key so the next draw publishes the anchor even if
+    // it lands on the exact pixel the previous menu did, then draw to publish it right away.
+    useEffect(() => {
+      menuCellRef.current = menuCell ?? null;
+      lastMenuAnchorRef.current = '\0';
+      requestDraw('scene');
+    }, [menuCell, requestDraw]);
 
     // Live split-menu preview: repaint whenever the previewed cell / counts change.
     useEffect(() => {
@@ -859,7 +1128,17 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
           const world = screenToWorld(sx, sy, cameraRef.current);
           const size = pending?.worldSize ?? DEFAULT_SQUARE_SCREEN_SIZE / cameraRef.current.scale;
           const rect: Rect = { x: world.x - size / 2, y: world.y - size / 2, w: size, h: size };
-          placePartitionBorder(partitionActiveLayer(partitionDocRef.current), rect);
+          const layer = partitionActiveLayer(partitionDocRef.current);
+          placePartitionBorder(layer, rect);
+          // Select what was just dropped, the way a placed room is. `placeBorder` seeds the first border
+          // and appends the rest, so the new one is always last. Without this the shape lands with no
+          // handles, dimensions, or + buttons until it is clicked a second time — the drop and the
+          // selection were two steps for what reads as one action.
+          partitionBorderSelRef.current = new Set([Math.max(0, layer.borders.length - 1)]);
+          // A fresh border has no panels to be inside of, and nothing selected in it.
+          partitionEnteredRef.current = null;
+          partitionCellSelRef.current = new Set();
+          onCellMenu?.(null);
           commitHistory();
           requestDraw('scene');
           return;
@@ -869,7 +1148,7 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
         const world = pending?.snapCenter ?? screenToWorld(sx, sy, cameraRef.current);
         createSquareAtWorld(world.x, world.y, pending?.worldSize, pending?.name);
       },
-      [cameraRef, createSquareAtWorld, createClusterAtWorld, commitHistory, requestDraw],
+      [cameraRef, createSquareAtWorld, createClusterAtWorld, commitHistory, requestDraw, onCellMenu],
     );
 
     // ---- Inline dimension editor -------------------------------------------
@@ -946,7 +1225,11 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
           const want = parseFloat(ed.value);
           if (Number.isFinite(want) && want > 0) {
             const world = Math.max(1, want * worldUnitsPerUnit(unitRef.current));
-            resizeBorderExtent(poly, ed.which === 'width' ? 'x' : 'y', world);
+            // Typing a size reshapes the border, which moves its cells — carry their frames and
+            // materials across, exactly as the drag gestures do.
+            moveLatticePreservingFrames(layer, () =>
+              resizeBorderExtent(poly, ed.which === 'width' ? 'x' : 'y', world),
+            );
             commitHistory();
             requestDraw('scene');
           }
@@ -1200,7 +1483,8 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
         // transient drag/selection state; reset the dedupe key so the layer navigator re-syncs.
         partitionDocRef.current = clonePartitionDoc(snapshot.partition);
         partitionSelSegRef.current = null;
-        partitionGroupSelRef.current = new Set();
+        partitionCellSelRef.current = new Set();
+        partitionEnteredRef.current = null; // border indices are snapshot-relative
         lastPartitionKeyRef.current = '';
         // Drop selection/transient highlights that may reference removed shapes.
         const ids = new Set(shapesRef.current.map((s) => s.id));
@@ -1232,7 +1516,16 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
     }, [applySnapshot]);
 
     // ---- Copy / cut / paste -------------------------------------------------
+    // In the Layers tool the "shapes" are trim BORDERS, so the same four shortcuts act on the selected
+    // border(s) — outline, lattice anchor, and panel grid travelling together — instead of on rooms.
     const copySelection = useCallback(() => {
+      if (layersActiveRef.current) {
+        const sel = partitionBorderSelRef.current;
+        if (sel.size === 0) return;
+        borderClipboardRef.current = copyBorders(partitionActiveLayer(partitionDocRef.current), sel);
+        borderPasteSeqRef.current = 0;
+        return;
+      }
       const sel = selectionRef.current;
       if (sel.size === 0) return;
       clipboardRef.current = cloneShapes(shapesRef.current.filter((s) => sel.has(s.id)));
@@ -1240,6 +1533,21 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
     }, []);
 
     const cutSelection = useCallback(() => {
+      if (layersActiveRef.current) {
+        const layer = partitionActiveLayer(partitionDocRef.current);
+        const sel = partitionBorderSelRef.current;
+        if (sel.size === 0) return;
+        borderClipboardRef.current = copyBorders(layer, sel);
+        borderPasteSeqRef.current = 0;
+        removeBorders(layer, sel);
+        partitionBorderSelRef.current = new Set();
+        partitionCellSelRef.current = new Set(); // cell keys are positional — the removed cells are gone
+        partitionEnteredRef.current = null; // the shape that was entered is gone
+        lastPartitionKeyRef.current = '';
+        commitHistory();
+        requestDraw('scene');
+        return;
+      }
       const sel = selectionRef.current;
       if (sel.size === 0) return;
       clipboardRef.current = cloneShapes(shapesRef.current.filter((s) => sel.has(s.id)));
@@ -1252,8 +1560,21 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
     }, [commitHistory, requestDraw]);
 
     // Remove the selected shapes outright (no clipboard write), e.g. via Delete /
-    // Backspace. A no-op when nothing is selected.
+    // Backspace. A no-op when nothing is selected. In the Layers tool it deletes the
+    // selected trim border(s) instead, panels and all.
     const deleteSelection = useCallback(() => {
+      if (layersActiveRef.current) {
+        const bsel = partitionBorderSelRef.current;
+        if (bsel.size === 0) return;
+        removeBorders(partitionActiveLayer(partitionDocRef.current), bsel);
+        partitionBorderSelRef.current = new Set();
+        partitionCellSelRef.current = new Set();
+        partitionEnteredRef.current = null; // the shape that was entered is gone
+        lastPartitionKeyRef.current = '';
+        commitHistory();
+        requestDraw('scene');
+        return;
+      }
       const sel = selectionRef.current;
       if (sel.size === 0) return;
       shapesRef.current = shapesRef.current.filter((s) => !sel.has(s.id));
@@ -1264,6 +1585,20 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
     }, [commitHistory, requestDraw]);
 
     const pasteClipboard = useCallback(() => {
+      if (layersActiveRef.current) {
+        const clip = borderClipboardRef.current;
+        if (clip.length === 0) return;
+        const layer = partitionActiveLayer(partitionDocRef.current);
+        // Cascade successive pastes by the same constant on-screen offset rooms use.
+        const seq = (borderPasteSeqRef.current += 1);
+        const offset = (16 / cameraRef.current.scale) * seq;
+        const added = pasteBorders(layer, clip, offset, offset);
+        partitionBorderSelRef.current = new Set(added);
+        lastPartitionKeyRef.current = '';
+        commitHistory();
+        requestDraw('scene');
+        return;
+      }
       const clip = clipboardRef.current;
       if (clip.length === 0) return;
       // Cascade each successive paste by a constant on-screen offset.
@@ -1372,13 +1707,14 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
       alignGuidesRef,
       facadeRef,
       layersActiveRef,
-      borderModeRef,
+      partitionEnteredRef,
+      partitionPlusRef,
       frameEditRef,
       partitionDocRef,
       partitionSelSegRef,
-      partitionGroupSelRef,
+      partitionCellSelRef,
       partitionBorderSelRef,
-      onCellContextMenu,
+      onCellMenu,
       onExitFrameEdit,
     });
 
@@ -1386,14 +1722,8 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
     const drawGridLayer = useCallback(() => {
       const ctx = gridCtxRef.current;
       if (!ctx) return;
-      // Facade mode (incl. the Layers tool): hide the CPlane grid — give the facade a clean blank surface to
-      // compose on. Switching into Facade mode therefore toggles the CPlane off.
-      if (facadeRef.current || layersActiveRef.current) {
-        ctx.clearRect(0, 0, width, height);
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, width, height);
-        return;
-      }
+      // One CPlane for both modes: the same faint scale/alignment reference on a white composing surface,
+      // so switching Plan ⇄ Facade doesn't shift the canvas out from under the drawing.
       drawGrid({
         ctx,
         width,
@@ -1428,6 +1758,26 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
         }
       }
 
+      // Facade mode enforces its OWN vocabulary against the partition instead: panel sizes flag individual
+      // panels, and the whole-elevation rules (WWR, U-value, standardization, counts, cost) breach globally.
+      // `activeConstraints` is already empty here — the two sets never overlap — so this is the only rule
+      // check running. The global figures come from the same `facadeMetrics` the StatsBar shows, so a flag
+      // and its readout can never disagree.
+      const facadeRules = facadeConstraintsRef.current;
+      let facadeViolations = NO_FACADE_VIOLATIONS;
+      // Gated on the Layers tool: panels only exist while it's on, so this skips the per-cell walk
+      // entirely the rest of the time rather than measuring an empty partition every frame.
+      if (layersActiveRef.current && hasAnyFacadeConstraint(facadeRules)) {
+        const layer = partitionActiveLayer(partitionDocRef.current);
+        facadeViolations = findFacadeViolations(
+          layer,
+          facadeMetricsOf(layer, worldUnitsPerUnit('feet')),
+          facadeRules,
+        );
+        for (const k of facadeViolations.flaggedKeys) violatedKeySet.add(k);
+      }
+      facadeFlaggedCellsRef.current = facadeViolations.flaggedCells;
+
       // Surface live stats to React (deduped on the displayed integers) — placement,
       // delete, paste, edits, and undo/redo all flow through a scene redraw, so this
       // catches them all. Areas are always in ft² regardless of the display unit.
@@ -1441,7 +1791,8 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
         if (isUsableFloorArea(s.name)) usable += interior;
       }
       const roomCount = shapes.length;
-      const constraintFlags = violations?.size ?? 0;
+      // One counter, whichever mode is live: flagged rooms in Plan, flagged panels in Facade.
+      const constraintFlags = (violations?.size ?? 0) + facadeViolations.flaggedCount;
       const totalAreaSqft = Math.round(total);
       const grossAreaSqft = Math.round(gross);
       const usableAreaSqft = Math.round(usable);
@@ -1459,8 +1810,9 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
       if (totalAreaExceeded) violatedKeySet.add('maxTotalAreaSqft');
       if (grossAreaExceeded) violatedKeySet.add('maxTotalGrossAreaSqft');
       if (roomCountExceeded) violatedKeySet.add('maxRoomCount');
+      const facadeGlobalExceeded = facadeViolations.globalBreached;
       const violatedKeys = [...violatedKeySet].sort();
-      const key = `${roomCount}|${constraintFlags}|${totalAreaSqft}|${grossAreaSqft}|${usableAreaSqft}|${totalAreaExceeded}|${grossAreaExceeded}|${roomCountExceeded}|${violatedKeys.join(',')}`;
+      const key = `${roomCount}|${constraintFlags}|${totalAreaSqft}|${grossAreaSqft}|${usableAreaSqft}|${totalAreaExceeded}|${grossAreaExceeded}|${roomCountExceeded}|${facadeGlobalExceeded}|${violatedKeys.join(',')}`;
       if (key !== lastStatsKeyRef.current) {
         lastStatsKeyRef.current = key;
         onStatsChange?.({
@@ -1469,6 +1821,7 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
           totalAreaSqft,
           grossAreaSqft,
           usableAreaSqft,
+          facadeGlobalExceeded,
           totalAreaExceeded,
           grossAreaExceeded,
           roomCountExceeded,
@@ -1529,15 +1882,11 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
       if (layersActiveRef.current) {
         // Edit-a-panel highlight: the representative cell outline + the hovered side's frame strip.
         const fe = frameEditRef.current;
-        const feFrame = fe ? groupFrame(partitionActiveLayer(partitionDocRef.current), fe.keys[0]) : null;
+        const feFrame = fe ? panelFrameAt(partitionActiveLayer(partitionDocRef.current), fe.keys[0]) : null;
         // Live boolean preview: classify the cursor over two picked, overlapping borders so the union "+" grid
         // / subtract hatch follows it (only meaningful in Border mode with exactly two borders picked).
         let boolHover = null as ReturnType<typeof borderBooleanHoverAt> | null;
-        if (
-          borderModeRef.current &&
-          partitionBorderSelRef.current.size === 2 &&
-          hoverPointRef.current
-        ) {
+        if (partitionBorderSelRef.current.size === 2 && hoverPointRef.current) {
           const cam = cameraRef.current;
           const w = screenToWorld(hoverPointRef.current.x, hoverPointRef.current.y, cam);
           boolHover = borderBooleanHoverAt(
@@ -1549,17 +1898,28 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
         }
         drawPartition(ctx, partitionDocRef.current, cameraRef.current, {
           selectedSegment: partitionSelSegRef.current,
-          selectedGroups: partitionGroupSelRef.current,
+          selectedCells: partitionCellSelRef.current,
+          enteredBorder: partitionEnteredRef.current,
+          plusPreview: partitionPlusRef.current,
+          // The Constraints "Visibility" eye hides the yellow flags in Facade mode too.
+          flaggedCells: showViolationsRef.current ? facadeFlaggedCellsRef.current : undefined,
+          kindPreview: kindPreviewRef.current,
+          optimizePreview: optimizePreviewRef.current,
           idView: idViewRef.current,
           frameShadow: frameShadowRef.current,
-          borderMode: borderModeRef.current,
           selectedBorders: partitionBorderSelRef.current,
           boolHover,
           unit: unitRef.current,
           showPanelNumbers: panelNumbersRef.current,
           frameEdit:
             fe && feFrame
-              ? { rect: fe.rect, frame: feFrame, hoverSide: fe.hoverSide, all: fe.allSides }
+              ? {
+                  // Every selected panel, so each reads as grabbable — any one drives the whole set.
+                  rects: cellRectsOf(partitionActiveLayer(partitionDocRef.current), new Set(fe.keys)),
+                  frame: feFrame,
+                  hoverSide: fe.hoverSide,
+                  all: fe.allSides,
+                }
               : null,
           splitPreview: splitPreviewRef.current,
         });
@@ -1567,7 +1927,7 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
         if (alignGuidesRef.current) {
           drawAlignmentGuides(ctx, alignGuidesRef.current, cameraRef.current, width, height);
         }
-        // Shift-drag multi-select rectangle — shows the area whose panel groups the selection will hit.
+        // Drag multi-select rectangle — shows the area whose panel groups the selection will hit.
         // (The Layers branch returns below, so this must be drawn here, not in the shared overlay pass.)
         const partitionMarquee = marqueeRef.current;
         if (partitionMarquee) {
@@ -1602,6 +1962,39 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
             ctx.stroke();
           }
           ctx.restore();
+        }
+        // Republish the open menu's anchor from its cell's CURRENT geometry. Doing it here — inside the
+        // draw that already runs for every drag, pan, and zoom frame — is what makes the menu follow the
+        // panel. Deduped on whole pixels, so an idle or unrelated frame costs one comparison.
+        if (menuCellRef.current) {
+          const menuLayer = partitionActiveLayer(partitionDocRef.current);
+          // Anchor to the SELECTION, not the clicked cell: one panel gives its own rect, several give the
+          // box enclosing them, so the bar hangs off the bottom centre of whatever is selected. Border mode
+          // selects boundaries rather than panels, so it falls back to those; the clicked cell is the last
+          // resort, covering the instant before a selection lands.
+          const menuRect =
+            selectedCellsExtent(menuLayer, partitionCellSelRef.current) ??
+            selectedBordersExtent(menuLayer, partitionBorderSelRef.current) ??
+            partitionCellRefRect(menuLayer, menuCellRef.current);
+          const canvasRect = rectRef.current;
+          let anchorKey = '';
+          let anchor: { x: number; y: number } | null = null;
+          if (menuRect && canvasRect) {
+            const mid = worldToScreen(
+              menuRect.x + menuRect.w / 2,
+              menuRect.y + menuRect.h,
+              cameraRef.current,
+            );
+            anchor = {
+              x: Math.round(canvasRect.left + mid.x),
+              y: Math.round(canvasRect.top + mid.y + CELL_MENU_GAP),
+            };
+            anchorKey = `${anchor.x},${anchor.y}`;
+          }
+          if (anchorKey !== lastMenuAnchorRef.current) {
+            lastMenuAnchorRef.current = anchorKey;
+            onCellMenuAnchorChange?.(anchor);
+          }
         }
         const summary = summarizeDoc(partitionDocRef.current, partitionBorderSelRef.current);
         const key = `${summary.layerCount}|${summary.activeIndex}|${summary.drawing}|${summary.cellCount}|${summary.borderSelCount}|${summary.borderSelCanBoolean}`;
@@ -1774,6 +2167,7 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
       onSelectedPanelChange,
       onPanelTypesChange,
       onPartitionChange,
+      onCellMenuAnchorChange,
       requestDraw,
     ]);
 
@@ -1892,28 +2286,6 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
       [tweenCameraTo],
     );
 
-    // Centre + zoom the camera so an axis-aligned WORLD rect fits the viewport with `padPx` margin, reusing the
-    // same easing. Used to fly to a facade panel for the Edit-a-panel session. Facade panels are small (a few
-    // feet), so the fit zooms all the way to MAX_SCALE — a 4px-per-unit cap (as used for rooms) would leave a
-    // panel tiny and read as "barely zoomed". Clamped to MAX_SCALE so a later wheel-zoom doesn't snap.
-    const focusRect = useCallback(
-      (r: Rect, padPx = 100) => {
-        const rect = rectRef.current;
-        if (!rect) return;
-        const aabbW = Math.max(r.w, 1);
-        const aabbH = Math.max(r.h, 1);
-        const scale = Math.min(
-          (rect.width - 2 * padPx) / aabbW,
-          (rect.height - 2 * padPx) / aabbH,
-          MAX_SCALE,
-        );
-        const ccx = r.x + r.w / 2;
-        const ccy = r.y + r.h / 2;
-        tweenCameraTo({ x: rect.width / 2 - ccx * scale, y: rect.height / 2 - ccy * scale, scale });
-      },
-      [tweenCameraTo],
-    );
-
     // Pick the next non-skipped violation, focus its room, preview its proposed fix,
     // and return the step descriptor (or a done-summary when none remain).
     const advanceFix = useCallback((): FixResult => {
@@ -2011,6 +2383,9 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
           // adjacent rooms' outer walls touch with no overlap.
           const outerW = valid.map((r) => r.widthFt * WORLD_UNITS_PER_FOOT + 2 * wall);
           const totalW = outerW.reduce((a, b) => a + b, 0);
+          // Deepest room in the row — the row's vertical extent, used to centre the
+          // whole block on the view even though the rooms hang from a shared top edge.
+          const maxH = Math.max(...valid.map((r) => r.heightFt * WORLD_UNITS_PER_FOOT));
 
           // Centre the whole row on the current view's centre in world space.
           const rect = rectRef.current;
@@ -2020,6 +2395,7 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
             : screenToWorld(width / 2, height / 2, cam);
 
           let cursor = centre.x - totalW / 2; // left edge of the current room's outer box
+          const top = centre.y - maxH / 2; // shared interior top edge for every room
           const ids: string[] = [];
           for (let i = 0; i < valid.length; i++) {
             const r = valid[i];
@@ -2028,7 +2404,7 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
             const square: Square = {
               id: createId(),
               x: cursor + wall, // interior sits inside its wall band
-              y: centre.y - hWorld / 2, // vertically centred on the row
+              y: top, // top-aligned: every room in the row shares one top edge
               width: wWorld,
               height: hWorld,
               rotation: 0,
@@ -2060,6 +2436,67 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
           placementRef.current = null;
           footprintArmRef.current = true;
           requestDraw('scene');
+        },
+        snapshotProject() {
+          // The live shapes belong to whichever mode is showing; the OTHER mode's work is
+          // sitting in the stash. Read both so a save from Plan never drops the Facade.
+          const stash = workspaceStashRef.current;
+          const live: WorkspaceState = {
+            shapes: cloneShapes(shapesRef.current),
+            footprints: cloneFootprints(footprintsRef.current),
+          };
+          const stashed = (w: typeof stash.plan): WorkspaceState | null =>
+            w ? { shapes: cloneShapes(w.shapes), footprints: cloneFootprints(w.footprints) } : null;
+          return {
+            plan: facadeRef.current ? stashed(stash.plan) : live,
+            facade: facadeRef.current ? live : stashed(stash.facade),
+            partition: clonePartitionDoc(partitionDocRef.current),
+            unit: unitRef.current,
+          };
+        },
+        loadProject(snapshot) {
+          // Deep-clone in, so editing the loaded drawing never mutates the stored snapshot.
+          const cloneWorkspace = (w: WorkspaceState | null) =>
+            w ? { shapes: cloneShapes(w.shapes), footprints: cloneFootprints(w.footprints) } : null;
+          const incoming = facadeRef.current ? snapshot.facade : snapshot.plan;
+          const other = cloneWorkspace(facadeRef.current ? snapshot.plan : snapshot.facade);
+          workspaceStashRef.current = facadeRef.current
+            ? { plan: other, facade: null }
+            : { plan: null, facade: other };
+          shapesRef.current = incoming ? cloneShapes(incoming.shapes) : [];
+          footprintsRef.current = incoming ? cloneFootprints(incoming.footprints) : [];
+          footprintDraftRef.current = null;
+          partitionDocRef.current = clonePartitionDoc(snapshot.partition);
+          unitRef.current = snapshot.unit;
+          // Every transient that could still point at the replaced document.
+          selectionRef.current = new Set();
+          activeEdgeRef.current = null;
+          edgeHoverRef.current = null;
+          hoverRef.current = null;
+          placementRef.current = null;
+          footprintArmRef.current = false;
+          resizingRef.current = false;
+          partitionSelSegRef.current = null;
+          partitionCellSelRef.current = new Set();
+          partitionBorderSelRef.current = new Set();
+          partitionEnteredRef.current = null;
+          frameEditRef.current = null;
+          highlightRef.current = { roomIds: new Set(), wallMap: new Map() };
+          lastPartitionKeyRef.current = '';
+          setEditor(null);
+          // A loaded drawing is its own starting point — undo must not reach back into
+          // whatever was on the canvas before it.
+          historyRef.current = {
+            undo: [],
+            redo: [],
+            baseline: {
+              shapes: cloneShapes(shapesRef.current),
+              footprints: cloneFootprints(footprintsRef.current),
+              unit: unitRef.current,
+              partition: clonePartitionDoc(partitionDocRef.current),
+            },
+          };
+          requestDraw('all');
         },
         runFind(query) {
           const r = findMatches(query, shapesRef.current);
@@ -2134,51 +2571,47 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
         selectLayer(index) {
           selectPartitionLayer(partitionDocRef.current, index);
           partitionBorderSelRef.current = new Set(); // border indices are per-layer — drop any pick
+          partitionEnteredRef.current = null; // ...and so is the shape that was entered
+          partitionCellSelRef.current = new Set();
+          onCellMenu?.(null);
           requestDraw('scene'); // navigation only — not an undo step
         },
         splitCell(ref, cols, rows) {
           splitPartitionCell(partitionActiveLayer(partitionDocRef.current), ref, cols, rows);
-          partitionGroupSelRef.current = new Set(); // start the new grid with no panel selected
+          partitionCellSelRef.current = new Set(); // start the new grid with no panel selected
           commitHistory(); // splitting a cell is one undo step
           requestDraw('scene');
         },
         partitionPanelStats() {
           return partitionPanelStatsOf(partitionActiveLayer(partitionDocRef.current));
         },
-        optimizePartition(strategy) {
+        facadeMetrics() {
+          return facadeMetricsOf(partitionActiveLayer(partitionDocRef.current), WORLD_UNITS_PER_FOOT);
+        },
+        optimizePartition(border, strategy) {
           const layer = partitionActiveLayer(partitionDocRef.current);
-          if (!partitionHasBoundary(layer)) return;
-          // Each strategy rationalizes the active layer in place; the remaining algorithms are implemented
-          // one at a time (see OptimizeStrategy). A strategy reports whether it actually changed anything.
-          let changed = false;
-          switch (strategy) {
-            case 'edge-normalize':
-              changed = optimizeEdgeNormalize(layer);
-              break;
-            case 'edge-profile':
-              changed = optimizeEdgeProfile(layer);
-              break;
-            case 'modular-cluster':
-              changed = optimizeModularCluster(layer);
-              break;
-            case 'stepped-edge':
-              changed = optimizeSteppedEdge(layer);
-              break;
-          }
-          if (!changed) return; // nothing moved → no undo step, no repaint
-          partitionGroupSelRef.current = new Set(); // selection keys may be stale after reshaping the border
+          // Per BORDER, not per layer: one facade can carry a stair-stepped tower beside a trim-banded
+          // podium. Re-picking the mode a border is already in clears it, so the menu doubles as the way out.
+          if (!optimizeBorder(layer, border, strategy)) return; // nothing changed → no undo step, no repaint
+          partitionCellSelRef.current = new Set(); // selection keys may be stale after reshaping the border
+          partitionEnteredRef.current = null;
+          onCellMenu?.(null);
           commitHistory(); // a rationalization pass is one undo step
           requestDraw('scene');
         },
         startPanelFrameEdit(clickRect?: Rect | null) {
           const layer = partitionActiveLayer(partitionDocRef.current);
-          const keys = [...partitionGroupSelRef.current];
+          // Edit acts on exactly the SELECTED panels — the ones washed grey on the canvas — and nothing
+          // else. It used to map them back to their material groups, which silently pulled in every
+          // identical panel on the elevation; select more panels (or Shift-click to take a whole type)
+          // to widen the batch.
+          const keys = [...partitionCellSelRef.current];
           if (!partitionHasBoundary(layer) || keys.length === 0) return null;
-          // Zoom to the panel the user actually right-clicked (when it belongs to the edited group); the frame
-          // still mirrors to the whole group. Fall back to the group's first cell if there's no clicked rect.
+          // The representative panel: the one actually clicked when it's in the selection, else the first.
+          // Used for the frame hit-testing and overlay only — Edit does not move the camera.
           let rect: Rect | null = null;
           if (clickRect) {
-            const k = cellGroupAt(layer, {
+            const k = cellKeyAt(layer, {
               x: clickRect.x + clickRect.w / 2,
               y: clickRect.y + clickRect.h / 2,
             });
@@ -2186,32 +2619,29 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
           }
           if (!rect) rect = representativeCell(layer, keys[0]);
           if (!rect) return null;
-          const cam = cameraRef.current;
-          frameEditRef.current = {
-            keys,
-            rect,
-            priorCamera: { x: cam.x, y: cam.y, scale: cam.scale },
-            hoverSide: null,
-            allSides: false,
-          };
+          frameEditRef.current = { keys, rect, hoverSide: null, allSides: false };
           // Auto-generate a uniform frame on the group (default 2″ mullion width).
-          const seeded = seedGroupFrames(layer, keys, inchesToWorld(DEFAULT_PANEL_FRAME_IN));
-          focusRect(rect);
+          const seeded = seedPanelFrames(layer, keys, inchesToWorld(DEFAULT_PANEL_FRAME_IN));
+          // Edit does NOT touch the camera. Framing the panel (or its shape) yanked the view on every
+          // click, and the user is already looking at what they selected — the session just makes the
+          // mullions grabbable where they already are.
           if (seeded) commitHistory(); // seeding the frame is one undo step
           requestDraw('scene');
           return { keys };
         },
         endPanelFrameEdit() {
-          const session = frameEditRef.current;
-          if (session) tweenCameraTo(session.priorCamera);
+          // Ends the session only — Edit never moved the camera, so there is nothing to restore.
           frameEditRef.current = null;
           requestDraw('scene');
         },
         assignPanelKind(kind: PanelKind | null) {
           const layer = partitionActiveLayer(partitionDocRef.current);
-          const keys = [...partitionGroupSelRef.current];
+          // Assign paints exactly the SELECTED panels. Materials used to be keyed by panel TYPE, so one
+          // assignment repainted every identical panel — which made "this bay is spandrel, the next is
+          // vision" impossible to express. The selection is the batch now.
+          const keys = [...partitionCellSelRef.current];
           if (!partitionHasBoundary(layer) || keys.length === 0) return;
-          setGroupPanelKind(layer, keys, kind);
+          setPanelKind(layer, keys, kind);
           commitHistory();
           requestDraw('scene');
         },
@@ -2257,6 +2687,167 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
           fixSessionRef.current = null;
           requestDraw('scene');
         },
+        demoRoomRects() {
+          const c = constraintsRef.current;
+          return shapesRef.current.map((s) => {
+            const fp = footprintWorld(s);
+            return {
+              id: s.id,
+              selected: selectionRef.current.has(s.id),
+              flagged: findViolations(s, c).any,
+              inner: polyBounds(fp.inner),
+              outer: polyBounds(fp.outer),
+              corners: fp.inner.map((p) => ({ ...p })),
+              thickness: fp.thickness.slice(),
+            };
+          });
+        },
+        demoBorderRect() {
+          const poly = partitionActiveLayer(partitionDocRef.current).borders[0];
+          return poly && poly.length ? partitionPolyBBox(poly) : null;
+        },
+        demoGridLines() {
+          return partitionGridLines(partitionActiveLayer(partitionDocRef.current), 0);
+        },
+        demoSelectedPanelRects() {
+          return cellRectsOf(partitionActiveLayer(partitionDocRef.current), partitionCellSelRef.current);
+        },
+        selectPanelsInWorldRect(rect) {
+          const layer = partitionActiveLayer(partitionDocRef.current);
+          const keys = cellKeysInRect(layer, rect);
+          partitionCellSelRef.current = new Set(keys);
+          requestDraw('scene');
+          return keys.length;
+        },
+        focusWorldRect(rect, opts) {
+          const canvas = rectRef.current;
+          if (!canvas) return;
+          const padPx = opts?.padPx ?? 120;
+          const fill = opts?.fill ?? 1;
+          // Per-side margins default to the uniform pad, so the plain call still centres on the viewport.
+          const top = opts?.insets?.top ?? padPx;
+          const right = opts?.insets?.right ?? padPx;
+          const bottom = opts?.insets?.bottom ?? padPx;
+          const left = opts?.insets?.left ?? padPx;
+          // The free box the subject is fitted into and centred on. Floored so absurd insets on a small
+          // window degrade to a cramped frame rather than an inverted one.
+          const boxW = Math.max(120, canvas.width - left - right);
+          const boxH = Math.max(120, canvas.height - top - bottom);
+          const scale = Math.min(
+            (boxW / Math.max(rect.w, 1)) * fill,
+            (boxH / Math.max(rect.h, 1)) * fill,
+            MAX_SCALE,
+          );
+          const target = {
+            x: left + boxW / 2 - (rect.x + rect.w / 2) * scale,
+            y: top + boxH / 2 - (rect.y + rect.h / 2) * scale,
+            scale,
+          };
+          // Skipping a step to its end must not have to sit through a 250ms ease per framing — and a tour
+          // that is being fast-forwarded has no viewer watching the camera travel anyway.
+          if (opts?.instant) {
+            if (cameraTweenRef.current) {
+              cancelAnimationFrame(cameraTweenRef.current);
+              cameraTweenRef.current = 0;
+            }
+            Object.assign(cameraRef.current, target);
+            requestDraw('all');
+            return;
+          }
+          tweenCameraTo(target);
+        },
+        demoSnapshot() {
+          const fe = frameEditRef.current;
+          const cam = cameraRef.current;
+          return {
+            shapes: cloneShapes(shapesRef.current),
+            footprints: cloneFootprints(footprintsRef.current),
+            partition: clonePartitionDoc(partitionDocRef.current),
+            selection: [...selectionRef.current],
+            cellSel: [...partitionCellSelRef.current],
+            borderSel: [...partitionBorderSelRef.current],
+            entered: partitionEnteredRef.current,
+            frameEdit: fe ? { ...fe, keys: [...fe.keys], rect: { ...fe.rect } } : null,
+            camera: { x: cam.x, y: cam.y, scale: cam.scale },
+          };
+        },
+        demoRestore(snap) {
+          // A camera tween still in flight holds the object it started with and would keep writing to it
+          // after the restore, dragging the view off the state being put back.
+          if (cameraTweenRef.current) {
+            cancelAnimationFrame(cameraTweenRef.current);
+            cameraTweenRef.current = 0;
+          }
+          shapesRef.current = cloneShapes(snap.shapes);
+          footprintsRef.current = cloneFootprints(snap.footprints);
+          partitionDocRef.current = clonePartitionDoc(snap.partition);
+          selectionRef.current = new Set(snap.selection);
+          partitionCellSelRef.current = new Set(snap.cellSel);
+          partitionBorderSelRef.current = new Set(snap.borderSel);
+          partitionEnteredRef.current = snap.entered;
+          frameEditRef.current = snap.frameEdit
+            ? { ...snap.frameEdit, keys: [...snap.frameEdit.keys], rect: { ...snap.frameEdit.rect } }
+            : null;
+          Object.assign(cameraRef.current, snap.camera);
+          activeEdgeRef.current = null;
+          placementRef.current = null;
+          // The React-side reports dedupe against their last published value, and the restore can easily
+          // land back on one of them — reset the keys so the redraw below re-publishes unconditionally.
+          lastStatsKeyRef.current = '';
+          lastSelCountRef.current = -1;
+          lastSelPanelKeyRef.current = '\0';
+          lastPanelTypesKeyRef.current = '';
+          lastPartitionKeyRef.current = '';
+          // The floating panel bar is React state, not canvas state: its anchor is republished by the draw
+          // below (hence the key reset), but a bar left hanging over a state that has no panel selected at
+          // all would be pointing at nothing, so that one case is closed outright.
+          lastMenuAnchorRef.current = '\0';
+          if (!snap.cellSel.length && !snap.frameEdit) onCellMenu?.(null);
+          commitHistory();
+          requestDraw('all');
+        },
+        demoDeselect() {
+          selectionRef.current = new Set();
+          partitionCellSelRef.current = new Set();
+          partitionBorderSelRef.current = new Set();
+          partitionSelSegRef.current = null;
+          frameEditRef.current = null;
+          activeEdgeRef.current = null;
+          // The floating bar is React state and hangs off the selection that just went away; the redraw
+          // republishes from the canvas, but with nothing selected there is nothing to republish.
+          lastSelCountRef.current = -1;
+          lastSelPanelKeyRef.current = '\0';
+          lastMenuAnchorRef.current = '\0';
+          onCellMenu?.(null);
+          requestDraw('all');
+        },
+        worldToClient(world) {
+          const canvas = rectRef.current;
+          const p = worldToScreen(world.x, world.y, cameraRef.current);
+          return { x: (canvas?.left ?? 0) + p.x, y: (canvas?.top ?? 0) + p.y };
+        },
+        resetForDemo() {
+          // Kill any framing tween first: it holds the camera object it started with and would keep
+          // writing to it for the rest of its 250ms, dragging the view back off the reset.
+          if (cameraTweenRef.current) {
+            cancelAnimationFrame(cameraTweenRef.current);
+            cameraTweenRef.current = 0;
+          }
+          resetCamera(); // world origin centred, 100% — the zoom every screen-px gesture below is sized in
+          shapesRef.current = [];
+          footprintsRef.current = [];
+          selectionRef.current = new Set();
+          activeEdgeRef.current = null;
+          workspaceStashRef.current = { plan: null, facade: null };
+          partitionDocRef.current = newDoc();
+          partitionCellSelRef.current = new Set();
+          partitionBorderSelRef.current = new Set();
+          partitionEnteredRef.current = null;
+          frameEditRef.current = null;
+          lastPartitionKeyRef.current = '';
+          commitHistory();
+          requestDraw('all');
+        },
       }),
       [
         requestDraw,
@@ -2268,7 +2859,9 @@ export const InfiniteCanvas = forwardRef<CanvasHandle, InfiniteCanvasProps>(
         advanceFix,
         applyFixedShape,
         tweenCameraTo,
+        resetCamera,
         constraintsRef,
+        onCellMenu,
       ],
     );
 

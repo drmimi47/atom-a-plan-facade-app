@@ -41,20 +41,28 @@ export const MAJOR_GRID_EVERY = 5;
  */
 export const MIN_VISIBLE_SPACING = 6;
 
+/**
+ * The CPlane, shared by BOTH editor modes: the grid drawn as a whisper. It keeps a sense of scale and
+ * alignment under the drawing without competing with it, on a pure-white composing surface. Plan mode used
+ * to carry a heavier, off-white variant of its own; one theme now means the canvas reads the same on either
+ * side of a mode switch instead of the background shifting under the user.
+ */
 export const GRID_THEME: GridTheme = {
-  background: '#f7f8fa',
-  minorLine: 'rgba(15, 23, 42, 0.06)',
-  majorLine: 'rgba(15, 23, 42, 0.12)',
-  axisLine: 'rgba(15, 23, 42, 0.30)',
-  border: 'rgba(15, 23, 42, 0.20)',
+  background: '#ffffff',
+  minorLine: 'rgba(15, 23, 42, 0.02)',
+  majorLine: 'rgba(15, 23, 42, 0.045)',
+  axisLine: 'rgba(15, 23, 42, 0.10)',
+  border: 'rgba(15, 23, 42, 0.07)',
 };
 
 /**
- * Dimension-line offset (screen px) from a facade BORDER's edge. Much smaller than the room/footprint gap
- * (which clears a wall band) so the border's dimensions hug its actual edges — a wall-less trim has no band to
- * clear. Used for both drawing and the editable-label hit-test, so they stay in sync.
+ * Dimension-line offset (screen px) from a facade BORDER's edge. Matches the room/footprint gap: the trim
+ * has no wall band to clear, but it does carry the edge-midpoint "+" duplicate buttons (EDGE_PLUS_OFFSET,
+ * 16px out) and the corner rotation arcs (half this gap), so the spines have to sit beyond both. The old
+ * hug-the-edge value predated those handles and ran straight through them. Used for both drawing and the
+ * editable-label hit-test, so they stay in sync.
  */
-export const BORDER_DIM_GAP = 12;
+export const BORDER_DIM_GAP = 36;
 
 /** A freshly placed square spans this many screen pixels, regardless of zoom. */
 export const DEFAULT_SQUARE_SCREEN_SIZE = 120;

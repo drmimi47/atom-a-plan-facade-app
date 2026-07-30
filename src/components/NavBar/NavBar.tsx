@@ -7,14 +7,17 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
-import { parseConstraintsLocally } from '../../../backend/parseConstraints';
+import {
+  parseConstraintsLocally,
+  parseFacadeConstraintsLocally,
+} from '../../../backend/parseConstraints';
+import type { Mode } from '../TopBar/TopBar';
 import type { CanvasHandle } from '../InfiniteCanvas/InfiniteCanvas';
 import type { LibraryCluster } from '../../library';
-import type { PanelType } from '../../facade/standardize';
 import { LibraryPanel } from '../Library/LibraryPanel';
 import styles from './NavBar.module.css';
 
-type Panel = 'constraints' | 'prompt' | 'library' | 'analyze' | null;
+type Panel = 'constraints' | 'prompt' | 'library' | null;
 
 /**
  * Example prompts cycled through the Generate box's placeholder, so a user unsure
@@ -22,8 +25,12 @@ type Panel = 'constraints' | 'prompt' | 'library' | 'analyze' | null;
  * (build new rooms) and FIND prompts ("show me / find / highlight…", which search
  * and highlight existing rooms). Shown one at a time on a slow rotation while the
  * box is open and empty; the runtime shuffle makes the order random each visit.
+ *
+ * Exported because the guided tour types one of these into the box for real. Taking the sentence from
+ * here rather than restating it means the tour can only ever demonstrate a prompt the box actually
+ * offers, and editing this list carries the tour along with it.
  */
-const PROMPT_EXAMPLES = [
+export const PROMPT_EXAMPLES = [
   "I want 1 kitchen, a foyer, and a 18'x12' bedroom...",
   'Show me all the kitchens...',
   'A 3-bedroom house with 2 bathrooms...',
@@ -94,28 +101,6 @@ function AnalyzeIcon() {
   );
 }
 
-/** Placeholder → a map-pin (teardrop with a hole). Now an inert button (the Facade Layers tool moved to the cube). */
-function PlaceholderIcon() {
-  return (
-    <svg {...ICON_PROPS}>
-      <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" />
-      <circle cx="12" cy="10" r="3" />
-    </svg>
-  );
-}
-
-/** Render → a picture/image icon (frame with a sun and a mountain). */
-function RenderIcon() {
-  return (
-    <svg {...ICON_PROPS}>
-      <rect x="3" y="4" width="18" height="16" rx="2" />
-      <circle cx="8.5" cy="9" r="1.6" />
-      <path d="M21 16l-5-5-5 5" />
-      <path d="M14 19l-3-3-6 4" />
-    </svg>
-  );
-}
-
 /** Generate → a magnifying glass with a sparkle at its centre (AI-powered search). */
 function GenerateIcon() {
   return (
@@ -142,7 +127,14 @@ function LibraryIcon() {
 
 interface NavBarProps {
   children: ReactNode;
-  /** Saved constraints text (owned by App, seeded from constraints_file.txt). */
+  /**
+   * Which rule set the Constraints box is editing — the editor mode it belongs to. Plan mode edits the room
+   * rules, Facade mode the curtain-wall ones; the two are separate bodies of text with separate vocabularies,
+   * and this selects which parser maps a line to the constraint field it defines (for the violated-line
+   * highlighting) as well as what the box calls itself.
+   */
+  constraintsScope?: Mode;
+  /** Saved constraints text for the active scope (owned by App). */
   constraintsText: string;
   /** Called only when the user clicks Save; App then re-parses the new text. */
   onConstraintsTextChange: (text: string) => void;
@@ -162,25 +154,32 @@ interface NavBarProps {
   constraintHighlightsVisible?: boolean;
   /** Toggle the canvas's yellow constraint highlights on/off (the eye's action). */
   onToggleConstraintHighlights?: () => void;
-  /** Whether the Analyze view is active (ghosts the canvas) — Plan mode only. */
+  /** Whether the bottom statistics are currently shown (the Analyze button reflects + toggles this). */
   analyzeActive?: boolean;
-  /** Toggle the Analyze view on/off (Plan mode). */
+  /** Show/hide the bottom statistics — the Analyze button's action, in both modes. */
   onToggleAnalyze?: () => void;
-  /** Fires true/false as the Facade Analyze popup opens/closes (drives the standardization view). */
-  onAnalyzeOpenChange?: (open: boolean) => void;
-  /** Standardized panel types shown in the Facade Analyze popup (colour-coded, with counts). */
-  panelTypes?: PanelType[];
-  /** Select every panel of a type (its shape ids) — clicking a type row in the Analyze popup. */
-  onSelectPanelType?: (shapeIds: string[]) => void;
-  /** Whether Facade mode is active — gates the Render button (Facade-only). */
-  facadeActive?: boolean;
-  /** Render the current selection (Facade mode); same action the right-click menu had. */
-  onRender?: () => void;
   /** Fires true/false as a nav popup (Constraints/Generate/Library) opens/closes — lets the App
    *  close the Render popup so only one top-right popup is open at a time. */
   onPanelOpenChange?: (open: boolean) => void;
+  /**
+   * External request to open (or close, with null) a nav popup. The guided demo drives the real UI rather
+   * than a mock of it, so it needs a way in; the nav still owns the state, this only nudges it.
+   */
+  requestPanel?: { panel: 'constraints' | 'prompt' | 'library' | null; seq: number } | null;
+  /** Which popup is open (null when none) — the read-back side of {@link requestPanel}. */
+  onPanelChange?: (panel: 'constraints' | 'prompt' | 'library' | null) => void;
+  /** Whether the room-prediction Adjacency Matrix window is open (the Generate tool button reflects it). */
+  matrixOpen?: boolean;
+  /** Show/hide the Adjacency Matrix — the Generate submenu's action. */
+  onToggleMatrix?: () => void;
   /** Start the guided constraint auto-fix flow (the Fix wand's action). */
   onFix?: () => void;
+  /**
+   * Whether the guided auto-fix wand can act in the current scope. It reshapes ROOMS, so Facade mode has
+   * nothing for it to do — the wand stays greyed out there rather than lighting up on a facade violation
+   * it cannot resolve. Defaults to true.
+   */
+  fixSupported?: boolean;
   /** True while a fix session is running — shows the Skip/Approve pill above Constraints. */
   fixActive?: boolean;
   /** Whether the current fix step has an applicable auto-fix (enables Approve). */
@@ -209,7 +208,7 @@ interface NavBarProps {
   canvasRef: RefObject<CanvasHandle>;
   /** Saved Library clusters (newest first). */
   library: LibraryCluster[];
-  /** Live count of rooms currently flagged for a constraint violation. */
+  /** Live count of units currently flagged for a constraint violation — rooms in Plan, panels in Facade. */
   constraintFlagCount: number;
   /** Remove a saved cluster by id. */
   onDeleteCluster: (id: string) => void;
@@ -233,6 +232,7 @@ interface NavBarProps {
  */
 export function NavBar({
   children,
+  constraintsScope = 'Plan',
   constraintsText,
   onConstraintsTextChange,
   defaultConstraintsText,
@@ -242,13 +242,13 @@ export function NavBar({
   onToggleConstraintHighlights,
   analyzeActive = false,
   onToggleAnalyze,
-  onAnalyzeOpenChange,
-  panelTypes,
-  onSelectPanelType,
-  facadeActive = false,
-  onRender,
   onPanelOpenChange,
+  requestPanel,
+  onPanelChange,
+  matrixOpen = false,
+  onToggleMatrix,
   onFix,
+  fixSupported = true,
   fixActive = false,
   fixCanApprove = false,
   onFixApprove,
@@ -268,6 +268,14 @@ export function NavBar({
   libraryDragActive = false,
 }: NavBarProps) {
   const [panel, setPanel] = useState<Panel>(null);
+  // `seq` (not the panel name) is the dependency: the demo may ask for the same panel on consecutive
+  // steps, and a name-keyed effect would ignore the second request.
+  const requestSeq = requestPanel?.seq;
+  useEffect(() => {
+    if (requestSeq == null) return;
+    setPanel(requestPanel?.panel ?? null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requestSeq]);
   const navRef = useRef<HTMLElement>(null);
   const libraryButtonRef = useRef<HTMLButtonElement>(null);
   const libraryPopupRef = useRef<HTMLDivElement>(null);
@@ -288,14 +296,14 @@ export function NavBar({
     window.addEventListener('resize', measure);
     return () => window.removeEventListener('resize', measure);
   }, [panel, fixActive]);
-  // The Generate button + its measured screen rect, so the tool menu can float
+  // The Generate button + its measured screen rect, so the find-match pill and the tool menu can float
   // centred just above it (anchored to the nav pill, not the centred prompt box).
   const generateButtonRef = useRef<HTMLButtonElement>(null);
   const [generateRect, setGenerateRect] = useState<DOMRect | null>(null);
-  // Measure the Generate button when its tool menu opens (panel === 'prompt') OR when
-  // a find-match pill needs to float above it — both anchor to the same screen rect.
+  // Measure whenever something needs that slot: a find-match pill, or the open Generate panel's tool menu.
+  const needsGenerateRect = findMatchCount != null || panel === 'prompt';
   useLayoutEffect(() => {
-    if (panel !== 'prompt' && findMatchCount == null) return;
+    if (!needsGenerateRect) return;
     const measure = () => {
       if (generateButtonRef.current) {
         setGenerateRect(generateButtonRef.current.getBoundingClientRect());
@@ -304,7 +312,7 @@ export function NavBar({
     measure();
     window.addEventListener('resize', measure);
     return () => window.removeEventListener('resize', measure);
-  }, [panel, findMatchCount]);
+  }, [needsGenerateRect]);
 
   // Publish the pill's horizontal extent so the StatsBar can place the stat pairs
   // in the open space on each side of it (re-measured on resize and font load).
@@ -325,21 +333,12 @@ export function NavBar({
   }, [onBoundsChange, onLibraryBoundsChange]);
 
   // Tell the App whether a nav popup is open, so it can close the Render popup (they share the
-  // top-right spot — only one should be open at a time).
+  // top-right spot — only one should be open at a time), and WHICH one, which the guided tour needs to
+  // put a step's view back when the user steps backwards through it.
   useEffect(() => {
     onPanelOpenChange?.(panel !== null);
-  }, [panel, onPanelOpenChange]);
-
-  // The Analyze popup is Facade-only; if the user leaves Facade mode while it's open, close it.
-  useEffect(() => {
-    if (!facadeActive && panel === 'analyze') setPanel(null);
-  }, [facadeActive, panel]);
-
-  // Tell the App when the Facade Analyze popup is open, so it can turn on the canvas's
-  // standardization view (colour panels by type + type-group click-select).
-  useEffect(() => {
-    onAnalyzeOpenChange?.(panel === 'analyze');
-  }, [panel, onAnalyzeOpenChange]);
+    onPanelChange?.(panel);
+  }, [panel, onPanelOpenChange, onPanelChange]);
 
   // Publish the open Library popup's rect (null when closed) so the canvas can treat the popup
   // itself as a save drop-target. Re-measured on resize (it's right-anchored, so its left moves).
@@ -403,9 +402,14 @@ export function NavBar({
   // The magic wand only lights up while at least one constraint is violated (a
   // flagged room or a breached global budget); otherwise it stays greyed out.
   const hasViolation = (violatedConstraintKeys?.length ?? 0) > 0 || constraintFlagCount > 0;
+  // A line defines a constraint field only under its OWN mode's vocabulary — the room parser can't read
+  // "Maximum panel width 6'" and the facade parser can't read "Minimum wall thickness 4"". Picking the
+  // matching one is what keeps the violated-line wash accurate in both modes.
+  const parseLine =
+    constraintsScope === 'Facade' ? parseFacadeConstraintsLocally : parseConstraintsLocally;
   const highlightedDraft = useMemo(() => {
     const lines = constraintsDraft.split('\n');
-    return lines.map((line, i) => {
+    const rendered = lines.map((line, i) => {
       const newline = i < lines.length - 1 ? '\n' : '';
       // Comment lines (ignored by the parser) are greyed and never count as violated.
       if (/^\s*#/.test(line)) {
@@ -418,7 +422,7 @@ export function NavBar({
       }
       // Map this line to the constraint field(s) it defines via the same local parser
       // the app uses, then flag it if any of those fields is currently violated.
-      const lineKeys = Object.keys(parseConstraintsLocally(line));
+      const lineKeys = Object.keys(parseLine(line));
       const violated = lineKeys.some((k) => violatedSet.has(k));
       return (
         <span key={i}>
@@ -427,7 +431,13 @@ export function NavBar({
         </span>
       );
     });
-  }, [constraintsDraft, violatedSet]);
+    // Trailing sentinel space. A block ending in "\n" renders NO final empty line box, but a textarea
+    // keeps one for the caret to sit on — so the backdrop came out a line shorter than the textarea, and
+    // once scrolled it could not follow the textarea all the way down. The text then lagged a line BELOW
+    // the caret, which is exactly the drift being chased. Under `pre-wrap` a trailing space hangs at the
+    // end of its line, so when the draft does NOT end in a newline this adds nothing and cannot re-wrap.
+    return [...rendered, ' '];
+  }, [constraintsDraft, violatedSet, parseLine]);
 
   // The open panel is "locked" while its async work runs (Constraints saving,
   // Prompt generating): every close path — Escape, backdrop click, the nav toggle —
@@ -511,6 +521,7 @@ export function NavBar({
             className={`${styles.item} ${panel === 'constraints' ? styles.active : ''}`}
             aria-pressed={panel === 'constraints'}
             aria-label="Constraints"
+            data-demo="nav-constraints"
             title="Constraints"
             onClick={() => toggle('constraints')}
           >
@@ -519,31 +530,19 @@ export function NavBar({
               <sup className={`${styles.badge} ${styles.badgeAlert}`}>{constraintFlagCount}</sup>
             )}
           </button>
-          {/* Facade Layers tool — its functions are now launched from the bottom-centre cube, so this button
-              is kept only as an inert (disabled) placeholder. */}
+          {/* Analyze shows/hides the live statistics along the bottom of the screen. Same in both
+              modes — the readouts themselves are what change with the mode. */}
+          {/* Reads as a "hide statistics" switch: the statistics are on by default, so the button only
+              lights up once they've been turned OFF — the selected state marks the deviation, not the
+              default. aria-pressed follows the same sense as the highlight. */}
           <button
             type="button"
-            className={styles.item}
-            aria-label="Facade layers"
-            title="Facade layers"
-            disabled
-          >
-            <PlaceholderIcon />
-          </button>
-          {/* Analyze behaves differently per mode: in Plan it ghosts the canvas (a view toggle);
-              in Facade it opens an empty top-right popup like Constraints/Library (no ghosting). */}
-          <button
-            type="button"
-            className={`${styles.item} ${
-              (facadeActive ? panel === 'analyze' : analyzeActive) ? styles.active : ''
-            }`}
-            aria-pressed={facadeActive ? panel === 'analyze' : analyzeActive}
+            className={`${styles.item} ${analyzeActive ? '' : styles.active}`}
+            aria-pressed={!analyzeActive}
             aria-label="Analyze"
-            title="Analyze"
-            onClick={() => {
-              if (facadeActive) toggle('analyze');
-              else onToggleAnalyze?.();
-            }}
+            data-demo="nav-analyze"
+            title={analyzeActive ? 'Hide statistics' : 'Show statistics'}
+            onClick={() => onToggleAnalyze?.()}
           >
             <AnalyzeIcon />
           </button>
@@ -556,23 +555,11 @@ export function NavBar({
             className={`${styles.item} ${panel === 'prompt' ? styles.active : ''}`}
             aria-pressed={panel === 'prompt'}
             aria-label="Generate"
+            data-demo="nav-generate"
             title="Generate"
             onClick={() => toggle('prompt')}
           >
             <GenerateIcon />
-          </button>
-          <button
-            type="button"
-            className={styles.item}
-            aria-label="Render"
-            title={facadeActive ? 'Render selected panels' : 'Render — Facade mode only'}
-            disabled={!facadeActive}
-            onClick={() => {
-              setPanel(null); // close any open nav popup — Render takes the top-right spot
-              onRender?.();
-            }}
-          >
-            <RenderIcon />
           </button>
           <button
             ref={libraryButtonRef}
@@ -582,6 +569,7 @@ export function NavBar({
             }`}
             aria-pressed={panel === 'library'}
             aria-label="Library"
+            data-demo="nav-library"
             title="Library"
             onClick={() => toggle('library')}
           >
@@ -602,12 +590,18 @@ export function NavBar({
             top: constraintsRect.top - 18,
           }}
         >
-          <button type="button" className={styles.fixSkip} onClick={() => onFixSkip?.()}>
+          <button
+            type="button"
+            className={styles.fixSkip}
+            data-demo="fix-skip"
+            onClick={() => onFixSkip?.()}
+          >
             Skip
           </button>
           <button
             type="button"
             className={styles.fixApprove}
+            data-demo="fix-approve"
             disabled={!fixCanApprove}
             onClick={() => onFixApprove?.()}
           >
@@ -644,8 +638,9 @@ export function NavBar({
                 type="button"
                 className={styles.tool}
                 aria-label="Fix"
-                title="Fix"
-                disabled={!hasViolation}
+                data-demo="constraints-fix"
+                title={fixSupported ? 'Fix' : 'Auto-fix applies to rooms — not available in Facade'}
+                disabled={!hasViolation || !fixSupported}
                 onClick={() => {
                   onFix?.();
                   setPanel(null); // close the panel so the zoomed room is visible
@@ -693,9 +688,12 @@ export function NavBar({
             </div>
           )}
 
-          <div className={styles.popup} role="dialog" aria-label="Constraints">
+          <div className={styles.popup} role="dialog" aria-label="Constraints" data-demo="constraints-box">
           <div className={styles.popupHeader}>
-            <span className={styles.popupTitle}>Constraints</span>
+            {/* Named for its scope, so it's never ambiguous which set of rules is being edited. */}
+            <span className={styles.popupTitle}>
+              {constraintsScope === 'Facade' ? 'Constraints — Facade' : 'Constraints — Plan'}
+            </span>
             <button
               type="button"
               className={styles.popupClose}
@@ -747,13 +745,16 @@ export function NavBar({
               >
                 Reset defaults
               </button>
+              {/* The label IS the state: "Save" while there's something to commit, "Saving…" during the
+                  round-trip, then "Saved" once the rules have landed — so clicking it visibly resolves
+                  rather than just greying out. */}
               <button
                 type="button"
                 className={styles.saveButton}
                 onClick={saveConstraints}
                 disabled={!constraintsDirty || constraintsBusy}
               >
-                {constraintsBusy ? 'Saving…' : 'Save'}
+                {constraintsBusy ? 'Saving…' : constraintsDirty ? 'Save' : 'Saved'}
               </button>
             </div>
           </div>
@@ -761,9 +762,8 @@ export function NavBar({
         </>
       )}
 
-      {/* Smart-find result pill — same floating pill as the Generate tool menu, shown
-          above the Generate button while a search is active. Hidden when the Generate
-          panel is open so it never overlaps that button's Rectangle/Polyline menu. */}
+      {/* Smart-find result pill — floats above the Generate button while a search is
+          active. Hidden when the Generate panel is open so it never overlaps the box. */}
       {findMatchCount != null && panel !== 'prompt' && generateRect && (
         <div
           className={styles.toolMenu}
@@ -783,63 +783,44 @@ export function NavBar({
 
       {panel === 'prompt' && (
         <>
-          {/* Sub-rounded tool menu floating centred just above the Generate button
-              (anchored to the nav pill, not the centred prompt box). */}
+          {/* Sub-rounded tool menu floating centred just above the Generate button, mirroring the one over
+              Constraints. Holds the room-prediction Adjacency Matrix: it tunes which room Generate reaches
+              for next, so it belongs with Generate rather than off in the dev cluster. */}
           {generateRect && (
             <div
               className={styles.toolMenu}
               style={{
                 left: generateRect.left + generateRect.width / 2,
-                // Clear the nav pill (its top sits ~5px above the button) with a gap.
                 top: generateRect.top - 18,
               }}
             >
               <button
                 type="button"
                 className={styles.tool}
-                aria-label="Rectangle tool"
-                title="Rectangle"
-                onClick={() => {
-                  // Arm the footprint tool and close the panel so the canvas is
-                  // free for the click-drag that draws the building outline.
-                  canvasRef.current?.armFootprintDraw();
-                  setPanel(null);
-                }}
+                aria-label="Adjacency matrix"
+                title="Adjacency matrix — tune which room is predicted next"
+                aria-pressed={matrixOpen}
+                onClick={() => onToggleMatrix?.()}
               >
-                <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">
-                  <rect
-                    x="5"
-                    y="5"
-                    width="12"
-                    height="12"
-                    rx="1.5"
+                {/* A 3×3 grid of cells — the matrix itself. */}
+                <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
+                  <g
                     fill="none"
                     stroke="currentColor"
                     strokeWidth="1.7"
-                  />
-                </svg>
-              </button>
-              <button type="button" className={styles.tool} aria-label="Polyline tool" title="Polyline">
-                <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
-                  <polyline
-                    points="3,21 6,14 13,14 10,5 18,8 21,3"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
                     strokeLinecap="round"
                     strokeLinejoin="round"
-                  />
-                  <circle cx="3" cy="21" r="1.7" fill="currentColor" />
-                  <circle cx="6" cy="14" r="1.7" fill="currentColor" />
-                  <circle cx="13" cy="14" r="1.7" fill="currentColor" />
-                  <circle cx="10" cy="5" r="1.7" fill="currentColor" />
-                  <circle cx="18" cy="8" r="1.7" fill="currentColor" />
-                  <circle cx="21" cy="3" r="1.7" fill="currentColor" />
+                  >
+                    <rect x="3.5" y="3.5" width="17" height="17" rx="2.5" />
+                    <line x1="3.5" y1="9.17" x2="20.5" y2="9.17" />
+                    <line x1="3.5" y1="14.83" x2="20.5" y2="14.83" />
+                    <line x1="9.17" y1="3.5" x2="9.17" y2="20.5" />
+                    <line x1="14.83" y1="3.5" x2="14.83" y2="20.5" />
+                  </g>
                 </svg>
               </button>
             </div>
           )}
-
           <div className={styles.search} role="dialog" aria-label="Generate">
             {/* Custom fading placeholder (a native one can't animate); shown only
                 while the box is empty. pointer-events:none keeps the input clickable. */}
@@ -855,6 +836,7 @@ export function NavBar({
             <input
               className={styles.searchInput}
               type="text"
+              data-demo="prompt-input"
               value={prompt}
               autoFocus
               disabled={promptBusy}
@@ -875,7 +857,13 @@ export function NavBar({
       )}
 
       {panel === 'library' && (
-        <div ref={libraryPopupRef} className={styles.popup} role="dialog" aria-label="Library">
+        <div
+          ref={libraryPopupRef}
+          className={styles.popup}
+          role="dialog"
+          aria-label="Library"
+          data-demo="library-box"
+        >
           <div className={styles.popupHeader}>
             <span className={styles.popupTitle}>Library</span>
             <button
@@ -901,84 +889,6 @@ export function NavBar({
         </div>
       )}
 
-      {/* Facade-mode Analyze popup — standardization view. Lists each unique panel "type" (identical
-          geometry = one type, shared colour) with its dimensions and count; clicking a type selects
-          all of its panels on the canvas. Closes only via its × (auto-closes on mode/panel switch). */}
-      {panel === 'analyze' && (
-        <div className={styles.popup} role="dialog" aria-label="Analyze">
-          <div className={styles.popupHeader}>
-            <span className={styles.popupTitle}>Analyze</span>
-            <button
-              type="button"
-              className={styles.popupClose}
-              aria-label="Close"
-              onClick={() => setPanel(null)}
-            >
-              ×
-            </button>
-          </div>
-          <AnalyzePanel types={panelTypes ?? []} onSelectType={onSelectPanelType} />
-        </div>
-      )}
     </>
-  );
-}
-
-/**
- * Body of the Facade Analyze popup: the standardized panel-type breakdown. One row per unique panel
- * type (colour swatch + dimensions + frame thickness + count); clicking a row selects every panel of
- * that type on the canvas. Helps designers count and categorise panel types automatically as they work.
- */
-function AnalyzePanel({
-  types,
-  onSelectType,
-}: {
-  types: PanelType[];
-  onSelectType?: (shapeIds: string[]) => void;
-}) {
-  const totalPanels = types.reduce((n, t) => n + t.count, 0);
-  return (
-    <div className={styles.analyzeBody}>
-      {types.length === 0 ? (
-        <p className={styles.analyzeEmpty}>
-          No panels yet. Drop panels in Facade mode — identical panels are grouped into one colour-coded
-          type so you can count and categorise them automatically.
-        </p>
-      ) : (
-        <>
-          <div className={styles.analyzeSummary}>
-            <span>
-              <strong>{totalPanels}</strong> panel{totalPanels === 1 ? '' : 's'}
-            </span>
-            <span>
-              <strong>{types.length}</strong> standardized type{types.length === 1 ? '' : 's'}
-            </span>
-          </div>
-          <ul className={styles.panelTypeList}>
-            {types.map((t) => (
-              <li key={t.signature}>
-                <button
-                  type="button"
-                  className={styles.panelTypeRow}
-                  title={`Select all ${t.count} panel${t.count === 1 ? '' : 's'} of Type ${t.index}`}
-                  onClick={() => onSelectType?.(t.shapeIds)}
-                >
-                  <span className={styles.panelTypeSwatch} style={{ background: t.color }} />
-                  <span className={styles.panelTypeInfo}>
-                    <span className={styles.panelTypeName}>Type {t.index}</span>
-                    <span className={styles.panelTypeDims}>
-                      {t.widthFt}′ × {t.heightFt}′
-                      {' · '}
-                      {t.uniformWalls ? `${t.wallInches}″ frame` : 'mixed frame'}
-                    </span>
-                  </span>
-                  <span className={styles.panelTypeCount}>×{t.count}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
-    </div>
   );
 }

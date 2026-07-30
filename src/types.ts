@@ -121,7 +121,11 @@ export interface Footprint {
 /** Live canvas statistics surfaced to the bottom StatsBar (all areas in ft²). */
 export interface CanvasStats {
   roomCount: number;
-  /** Number of rooms currently flagged (yellow) for violating a constraint. */
+  /**
+   * Number of things currently flagged (yellow) for violating a constraint: rooms in Plan mode, facade
+   * panels in Facade mode. The two rule sets are mode-scoped and never both active, so one counter serves
+   * both — it is always "how many units the ACTIVE mode's rules flag".
+   */
   constraintFlags: number;
   /** Sum of every room's interior (white infill) area — Gross Internal Area (GIA). */
   totalAreaSqft: number;
@@ -142,10 +146,16 @@ export interface CanvasStats {
   /** True when the room count exceeds the global Max Room Count constraint. */
   roomCountExceeded: boolean;
   /**
-   * Names of the constraint fields currently being violated anywhere on the canvas
-   * (per-room rules unioned across all rooms, plus the breached global budgets).
-   * Lets the Constraints box highlight the exact lines whose rules are in effect and
-   * broken. Each entry is a `keyof Constraints` (e.g. "minRoomSideFt").
+   * Facade mode: true when a whole-elevation facade rule is breached (WWR, U-value, standardization,
+   * type/panel count, cost). Those describe the facade as a whole rather than one panel, so — like the
+   * plan-mode budgets above — they wash the canvas instead of flagging a unit. Always false in Plan mode.
+   */
+  facadeGlobalExceeded: boolean;
+  /**
+   * Names of the constraint fields currently being violated anywhere on the canvas — per-unit rules
+   * unioned across every room/panel, plus the breached global budgets. Lets the Constraints box highlight
+   * the exact lines whose rules are in effect and broken. Each entry is a `keyof Constraints` in Plan mode
+   * and a `keyof FacadeConstraints` in Facade mode (the box is showing that mode's rules either way).
    */
   violatedKeys: string[];
 }

@@ -247,8 +247,8 @@ const FIND_ROOM_ALPHA = 0.22;
 /** Dev mode or the Analyze view renders every committed shape at this opacity (ghosted). */
 const DEBUG_GHOST_ALPHA = 0.4;
 
-/** Radius (screen px) of the edge-midpoint plus buttons. */
-const EDGE_PLUS_RADIUS = 7;
+/** Radius (screen px) of the edge-midpoint plus buttons. Shared with the facade border's copy. */
+export const EDGE_PLUS_RADIUS = 7;
 /** How far (screen px) each plus button's centre sits beyond the shape's outline. */
 const EDGE_PLUS_OFFSET = 16;
 
@@ -264,7 +264,7 @@ const PREDICTION_RING_COLOR = '#8a8f98';
  * Draws a small circle with a centred plus, at (cx, cy) in screen space — an "add"
  * affordance sitting just off an edge midpoint. White fill so it reads over a wall.
  */
-function drawPlusCircle(
+export function drawPlusCircle(
   ctx: CanvasRenderingContext2D,
   cx: number,
   cy: number,
@@ -705,7 +705,11 @@ export function footprintWorld(
  * `pts` are the corner points in the CURRENT canvas frame; assumes strokeStyle /
  * lineWidth are already set.
  */
-function drawCornerRotationArcs(ctx: CanvasRenderingContext2D, pts: Vec2[], radius: number): void {
+export function drawCornerRotationArcs(
+  ctx: CanvasRenderingContext2D,
+  pts: Vec2[],
+  radius: number,
+): void {
   const n = pts.length;
   for (let i = 0; i < n; i++) {
     const c = pts[i];
@@ -1297,15 +1301,127 @@ function ringArea(pts: Vec2[]): number {
   return s / 2;
 }
 
+/* ---- Degenerate-overlap tolerances (world units; a foot is WORLD_UNITS_PER_FOOT of these) ----
+ * Ordered TOUCH ≪ NUDGE ≪ SNAP, which is what makes the retry below reversible: the nudge is far
+ * bigger than the error that decides whether two edges touch, and far smaller than the snap that puts
+ * the answer back on the coordinates the inputs were built from. All three are invisible on screen. */
+const TOUCH_TOL = 1e-4;
+const NUDGE = 1e-3;
+const SNAP_TOL = 1e-2;
+
+/** Every vertex of `inner` inside `outer`, at least one of them strictly (not just lying on an edge). */
+function polygonContains(outer: Vec2[], inner: Vec2[]): boolean {
+  let strict = false;
+  for (const p of inner) {
+    const on = polygonBoundaryDist(p, outer) <= TOUCH_TOL;
+    if (!on && !pointInPolygon(p, outer)) return false;
+    if (!on) strict = true;
+  }
+  return strict;
+}
+
+/** Distance from a point to a polygon's outline. */
+function polygonBoundaryDist(p: Vec2, poly: Vec2[]): number {
+  let best = Infinity;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    best = Math.min(best, distPointToSegment(p, poly[j], poly[i]));
+  }
+  return best;
+}
+
+/** Do the two outlines meet without crossing — a shared corner or a run of collinear edge? */
+function polygonsTouch(a: Vec2[], b: Vec2[]): boolean {
+  return (
+    a.some((p) => polygonBoundaryDist(p, b) <= TOUCH_TOL) ||
+    b.some((p) => polygonBoundaryDist(p, a) <= TOUCH_TOL)
+  );
+}
+
+/** Push every vertex `by` away from the centroid — just enough to lift shared edges off each other. */
+function inflatePolygon(poly: Vec2[], by: number): Vec2[] {
+  const cx = poly.reduce((s, p) => s + p.x, 0) / poly.length;
+  const cy = poly.reduce((s, p) => s + p.y, 0) / poly.length;
+  return poly.map((p) => {
+    const dx = p.x - cx;
+    const dy = p.y - cy;
+    const len = Math.hypot(dx, dy);
+    return len > 0 ? { x: p.x + (dx / len) * by, y: p.y + (dy / len) * by } : { x: p.x, y: p.y };
+  });
+}
+
 /**
- * Polygon boolean of two simple polygons via the Greiner–Hormann algorithm,
- * returning the largest resulting ring. `union=false` computes `subject \ clip`
- * (difference); `union=true` computes `subject ∪ clip`. The only thing that differs
- * between the two ops is which side of the CLIP is kept (inside the subject for
- * difference, outside it for union). Tuned for the room footprints here; transversal
- * crossings only (no special handling of exactly-collinear shared edges).
+ * Put a ring computed against a NUDGED clip back onto the geometry the user actually drew: pull each
+ * coordinate onto the input coordinate it is within {@link SNAP_TOL} of, drop the duplicate vertices that
+ * collapses, then drop the vertices left sitting on a straight run. What comes back out is the exact
+ * rectangle (or L) the two rooms describe, with no trace of the nudge.
+ */
+function cleanRing(ring: Vec2[], subject: Vec2[], clip: Vec2[]): Vec2[] {
+  const xs = [...subject, ...clip].map((p) => p.x);
+  const ys = [...subject, ...clip].map((p) => p.y);
+  const snap = (v: number, axis: number[]) => {
+    let best = v;
+    let bestD = SNAP_TOL;
+    for (const c of axis) {
+      const d = Math.abs(c - v);
+      if (d < bestD) {
+        bestD = d;
+        best = c;
+      }
+    }
+    return best;
+  };
+  const snapped = ring.map((p) => ({ x: snap(p.x, xs), y: snap(p.y, ys) }));
+
+  const dedup: Vec2[] = [];
+  for (const p of snapped) {
+    const last = dedup[dedup.length - 1];
+    if (!last || Math.hypot(p.x - last.x, p.y - last.y) > SNAP_TOL) dedup.push(p);
+  }
+  while (
+    dedup.length > 1 &&
+    Math.hypot(dedup[0].x - dedup[dedup.length - 1].x, dedup[0].y - dedup[dedup.length - 1].y) <=
+      SNAP_TOL
+  ) {
+    dedup.pop();
+  }
+
+  const out: Vec2[] = [];
+  for (let i = 0; i < dedup.length; i++) {
+    const prev = dedup[(i + dedup.length - 1) % dedup.length];
+    const cur = dedup[i];
+    const next = dedup[(i + 1) % dedup.length];
+    // Perpendicular distance from the straight run through its neighbours: a corner survives, a point
+    // that only marks where the nudge stepped does not.
+    if (distPointToSegment(cur, prev, next) > SNAP_TOL) out.push(cur);
+  }
+  return out.length >= 3 ? out : dedup;
+}
+
+/**
+ * Polygon boolean of two simple polygons via the Greiner–Hormann algorithm, returning the largest
+ * resulting ring. `union=false` computes `subject \ clip` (difference); `union=true` computes
+ * `subject ∪ clip`.
+ *
+ * Greiner–Hormann sees TRANSVERSAL crossings only, and two rooms of the same height standing side by side
+ * have none: every meeting point is a shared corner or a collinear run, which {@link segInt} rejects. That
+ * is not an exotic case — it is what "drop two rooms and overlap them" produces — and left alone it took
+ * the containment fallback below and answered "one swallowed the other", silently deleting a room on
+ * union. So that case is detected and retried against a hair-nudged clip, which turns every degenerate
+ * touch into a real crossing, and {@link cleanRing} then takes the nudge back out of the answer.
  */
 function polygonBoolean(subject: Vec2[], clip: Vec2[], union: boolean): Vec2[] | null {
+  const direct = polygonBooleanCore(subject, clip, union);
+  if (direct !== DEGENERATE) return direct;
+  const nudged = polygonBooleanCore(subject, inflatePolygon(clip, NUDGE), union);
+  if (nudged === DEGENERATE || !nudged) return null;
+  const cleaned = cleanRing(nudged, subject, clip);
+  return cleaned.length >= 3 ? cleaned : null;
+}
+
+/** Returned by the core when the two outlines only touch, so the caller knows to retry on a nudged clip. */
+const DEGENERATE: Vec2[] = [];
+
+function polygonBooleanCore(subject: Vec2[], clip: Vec2[], union: boolean): Vec2[] | null {
   interface N {
     x: number;
     y: number;
@@ -1371,11 +1487,16 @@ function polygonBoolean(subject: Vec2[], clip: Vec2[], union: boolean): Vec2[] |
   }
 
   if (allInts.length === 0) {
-    // No crossings: one polygon wholly inside the other, or disjoint.
-    const subjInClip = pointInPolygon(subject[0], clip);
+    // No crossings: one polygon wholly inside the other, disjoint — or only TOUCHING, which is the
+    // degenerate case this cannot answer and hands back for a retry. Containment is tested over every
+    // vertex rather than the first one alone, because a first vertex sitting exactly ON the other outline
+    // (two rooms of the same height) is precisely where `pointInPolygon` cannot be trusted.
+    const subjInClip = polygonContains(clip, subject);
+    const clipInSubj = polygonContains(subject, clip);
+    if (!subjInClip && !clipInSubj && polygonsTouch(subject, clip)) return DEGENERATE;
     if (union) {
       if (subjInClip) return clip.map((p) => ({ x: p.x, y: p.y })); // subject swallowed
-      if (pointInPolygon(clip[0], subject)) return subject.map((p) => ({ x: p.x, y: p.y }));
+      if (clipInSubj) return subject.map((p) => ({ x: p.x, y: p.y }));
       return null; // disjoint — no single union ring
     }
     return subjInClip ? null : subject.map((p) => ({ x: p.x, y: p.y })); // difference
@@ -3084,6 +3205,27 @@ export function lockAnchorScreen(shape: Square, camera: Camera): Vec2 {
   const cos = Math.cos(a);
   const sin = Math.sin(a);
   return { x: c.x + vx * cos - hy * sin, y: c.y + vx * sin + hy * cos };
+}
+
+/**
+ * Wrap a bare polygon (a facade trim border) as a zero-wall `Square`, so it can feed the room machinery
+ * that operates on shapes: the edge stretch, the wall snapper, and the edge-plus button geometry. With zero
+ * walls inner == outer == centreline, and because {@link worldToScreen} is affine with a uniform scale, a
+ * shape whose origin is (0,0) has its "local" frame coincide with world space — so the corners can be
+ * passed through as-is.
+ */
+export function polygonShape(corners: { x: number; y: number }[]): Square {
+  return {
+    id: 'facade-border',
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    rotation: 0,
+    walls: { n: 0, e: 0, s: 0, w: 0 },
+    dots: false,
+    corners: corners.map((p) => ({ x: p.x, y: p.y })),
+  };
 }
 
 /**

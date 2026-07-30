@@ -1,8 +1,8 @@
 import styles from './TopRightBar.module.css';
 
 interface TopRightBarProps {
-  /** Export the current plan. */
-  onExport: () => void;
+  /** Run the demo. Placeholder for now. */
+  onDemo: () => void;
   /** Signed-in user's email — shown as the sign-out hover tooltip. */
   email?: string | null;
   /** Sign out (signed-in) or end the guest session. */
@@ -10,14 +10,14 @@ interface TopRightBarProps {
 }
 
 /**
- * Top-right action cluster, mirroring the top-left toolbar's styling: an "Export" text
+ * Top-right action cluster, mirroring the top-left toolbar's styling: a "Demo" text
  * pill followed by a circular sign-out icon button. Rendered once past the login gate.
  */
-export function TopRightBar({ onExport, email, onSignOut }: TopRightBarProps) {
+export function TopRightBar({ onDemo, email, onSignOut }: TopRightBarProps) {
   return (
     <div className={styles.bar}>
-      <button type="button" className={styles.export} onClick={onExport}>
-        Export
+      <button type="button" className={styles.demo} onClick={onDemo}>
+        Demo
       </button>
       <button
         type="button"
