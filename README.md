@@ -1,20 +1,9 @@
 # atom-a-plan-facade-app
 
-> ⚠️ **Test phase — incomplete.** This project is an early prototype under active
-> development. Features are partial, APIs and data shapes may change, and some flows
-> (e.g. password reset, a serverless key proxy) are stubbed or unfinished. It is not
-> production-ready and is intended for internal testing and experimentation only.
+A browser-based design tool prototype for exploring architectural workflows in plan and facade. Geometry is on an infinite canvas and governed by design rules written in plain English — minimum wall thickness, window-to-wall ratio, panel standardization — which are parsed into a typed schema and checked live, so what breaks a rule is flagged as you draw it.
 
-**Atom** is an experimental, browser-based tool for rapidly sketching
-architectural floor plans on an infinite canvas. You describe design rules in plain
-English (e.g. minimum wall thickness) and lay out rooms whose relationships are driven
-by an editable adjacency matrix; the app parses those constraints — via the Anthropic
-LLM with a deterministic regex fallback — flags violations, and renders the resulting
-partitions and facades. Sign-in (optional, via Firebase) persists your constraints and
-matrix per account, while Guest mode runs everything locally without saving.
+**Plan** — drop rooms carrying real walls, areas and dimensions; reshape them by vertex, wall face or edge; unite and subtract them, with the operation chosen by where you click rather than by a toolbar. Violations wash against the rule that caused them, and a guided wand ghosts each repair before you approve it. Describe a layout in a sentence and it is built from a room catalog; sweep a cluster onto the Library to place it again later.
 
-## Setup & deployment
+**Facade** — form an elevation, split it into a panel lattice, then tune it by dragging a whole mullion line or a single segment. Boundary rationalization offers four strategies, each previewed on hover, for absorbing angled edges into whole panels. Painted panel selections take shared parametric frames and materials, with window-to-wall ratio, U-value, standardization and cost updating as the design moves.
 
-For provisioning on a VM or other host — prerequisites, build/run steps, the full
-environment-variable reference, the client-bundle security caveats, and whether Firebase
-project access is required — see **[SETUP.md](SETUP.md)**.
+Constraint and prompt parsing run through an LLM with a deterministic regex fallback, so the rules still resolve with no model available. Sign-in (optional, via Firebase) persists constraints and the adjacency matrix per account; Guest mode runs entirely locally. 

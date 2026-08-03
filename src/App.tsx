@@ -14,7 +14,11 @@ import {
   EMPTY_CONSTRAINTS,
   EMPTY_FACADE_CONSTRAINTS,
 } from '../backend/types';
-import { parseConstraints, parseFacadeConstraints } from '../backend/parseConstraints';
+import {
+  parseConstraints,
+  parseFacadeConstraints,
+  anthropicEnabled,
+} from '../backend/parseConstraints';
 import { parsePrompt } from '../backend/parsePrompt';
 import { resolveRoomList } from './rooms/roomCatalog';
 import { isFindQuery } from './search/findQuery';
@@ -69,6 +73,8 @@ import {
   withBandInches,
 } from './facade/catalog';
 import { LoginModal } from './components/LoginModal/LoginModal';
+import { ApiKeyNotice, type ApiKeyFeature } from './components/ApiKeyNotice/ApiKeyNotice';
+import { geminiEnabled } from './facade/renderer';
 import { useAuth } from './auth/useAuth';
 import { firebaseEnabled } from './auth/firebase';
 import { signOutUser } from './auth/auth';
@@ -245,6 +251,11 @@ export default function App() {
   // (gates the panel's Render button). Triggered by the NavBar Render button.
   const [render, setRender] = useState<RenderState | null>(null);
   const [selectionCount, setSelectionCount] = useState(0);
+
+  // Non-null while the "this AI feature is disabled" modal is up. Set only from
+  // user-initiated actions (Render / Save constraints / Prompt submit) — never from
+  // the on-mount parse, which would pop the modal before the user did anything.
+  const [apiKeyNotice, setApiKeyNotice] = useState<ApiKeyFeature | null>(null);
 
   // Facade "smart panel" assembly metadata, keyed by assembly type (e.g. "UCWP"). Shared by every
   // panel of a type — editing it in the inspector updates them all and feeds the render prompt.
@@ -474,6 +485,11 @@ export default function App() {
   // Render the current selection. With nothing selected the panel still opens in an idle state
   // ("Select geometry to render.") and its Render button stays disabled until geometry is selected.
   const handleRender = useCallback(() => {
+    // No Gemini key → there is no offline fallback, so stop here and say why.
+    if (!geminiEnabled) {
+      setApiKeyNotice('gemini');
+      return;
+    }
     const sel = canvasHandle.current?.captureSelectionShapes();
     if (sel) void runRender(sel.shapes, sel.count);
     else setRender({ status: 'idle', count: 0 });
@@ -543,6 +559,8 @@ export default function App() {
   // when signed in — persist the text to the user's account. Routed by the CURRENT mode, so the box
   // always edits the rule set it is showing.
   const handleConstraintsSave = async (text: string) => {
+    // No Anthropic key → note it, then carry on: the regex fallback still applies the rules.
+    if (!anthropicEnabled && text.trim()) setApiKeyNotice('anthropic');
     if (editorMode === 'Facade') {
       await applyFacadeConstraintsText(text);
       if (user) void saveUserFacadeConstraints(user.uid, text);
@@ -570,6 +588,8 @@ export default function App() {
       setFindCount(n); // no LLM, no busy state — find is synchronous and local
       return;
     }
+    // Same as constraints: the local parser still runs, so this informs rather than blocks.
+    if (!anthropicEnabled) setApiKeyNotice('anthropic');
     setPromptBusy(true);
     try {
       const spec = await parsePrompt(text);
@@ -914,6 +934,10 @@ export default function App() {
       {demoOpen && <DemoOverlay ctx={demoCtx} onExit={() => setDemoOpen(false)} />}
       {authResolved && !user && !guest && (
         <LoginModal enabled={firebaseEnabled} onGuest={() => setGuest(true)} />
+      )}
+      {/* Sits above every other layer: reports that an AI feature's API key was removed. */}
+      {apiKeyNotice && (
+        <ApiKeyNotice feature={apiKeyNotice} onClose={() => setApiKeyNotice(null)} />
       )}
     </>
   );

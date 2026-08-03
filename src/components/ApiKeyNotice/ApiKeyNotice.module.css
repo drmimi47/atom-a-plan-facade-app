@@ -1,0 +1,119 @@
+/* Mirrors LoginModal's card/backdrop, but sits above it and dismisses on click. */
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 59;
+  background: rgba(15, 23, 42, 0.4);
+}
+
+.card {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 60;
+
+  width: 380px;
+  max-width: calc(100vw - 32px);
+  padding: 26px 28px 22px;
+
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+
+  background: #ffffff;
+  border: 1px solid rgba(15, 23, 42, 0.16);
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(15, 23, 42, 0.22);
+
+  font-family: inherit;
+  color: #18181b;
+}
+
+.close {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+
+  border: none;
+  background: none;
+  padding: 2px 6px;
+  cursor: pointer;
+
+  font-family: inherit;
+  font-size: 18px;
+  line-height: 1;
+  color: #a1a1aa;
+  transition: color 120ms ease;
+}
+
+.close:hover {
+  color: #18181b;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Amber dot — matches the warning tone already used for .error in LoginModal. */
+.badge {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  width: 22px;
+  height: 22px;
+
+  font-size: 13px;
+  font-weight: 700;
+  color: #b45309;
+  background: rgba(180, 83, 9, 0.12);
+  border-radius: 999px;
+}
+
+.title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #52525b;
+}
+
+.note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #a1a1aa;
+}
+
+/* Dark pill — same as LoginModal's .primary. */
+.primary {
+  margin-top: 6px;
+  align-self: flex-end;
+  border: none;
+  cursor: pointer;
+
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #ffffff;
+
+  padding: 9px 22px;
+  background: #18181b;
+  border-radius: 999px;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.2);
+  transition: background 120ms ease;
+}
+
+.primary:hover {
+  background: #000000;
+}

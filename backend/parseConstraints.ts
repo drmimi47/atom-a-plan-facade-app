@@ -156,6 +156,14 @@ export function stripComments(text: string): string {
 }
 
 /**
+ * True only when an Anthropic API key is configured. Mirrors `geminiEnabled` in
+ * src/facade/renderer.ts. The parsers below don't need this — they check the key
+ * themselves and fall back locally — it exists so the UI can tell the user *why*
+ * the deterministic parser is running instead of silently downgrading.
+ */
+export const anthropicEnabled: boolean = Boolean(import.meta.env.VITE_ANTHROPIC_API_KEY);
+
+/**
  * Parse the constraints text into the structured schema. Prefers the Anthropic
  * LLM (handles free-form phrasing) but falls back to a small deterministic parser
  * when no API key is set or the request fails — so the app always works, key or
