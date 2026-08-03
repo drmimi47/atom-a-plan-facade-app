@@ -12,7 +12,7 @@ import { getFirestore, type Firestore } from 'firebase/firestore';
  *  FIREBASE BOOTSTRAP (Auth + Firestore)
  * ============================================================================
  *
- * Reads the project config from VITE_FIREBASE_* env vars (see .env.example), the same
+ * Reads the project config from VITE_FIREBASE_* env vars (see SETUP.md), the same
  * pattern as VITE_ANTHROPIC_API_KEY. The whole feature is OPTIONAL: until the user fills
  * those vars in `.env.local`, `firebaseEnabled` is false and `auth`/`db` are null, so the
  * login modal still shows (with a "not configured" note) and Guest keeps the app usable.

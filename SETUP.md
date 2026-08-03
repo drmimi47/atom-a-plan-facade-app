@@ -30,8 +30,8 @@ beyond the static host.
 
 ## Environment variables
 
-All config is supplied through `VITE_*` environment variables (see `.env.example` for
-the full list). Locally these go in a git-ignored `.env.local`; on a VM / CI they can
+All config is supplied through the `VITE_*` environment variables listed below — this
+table is the full reference. Locally these go in a git-ignored `.env.local`; on a VM / CI they can
 be real environment variables or injected at build time. **They are read at *build*
 time and baked into the bundle**, so the build must run with them present.
 

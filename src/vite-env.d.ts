@@ -5,7 +5,7 @@ interface ImportMetaEnv {
   readonly VITE_ANTHROPIC_API_KEY?: string;
   /** Google Gemini API key for the Facade-mode AI renderer (Gemini 2.5 Flash Image). */
   readonly VITE_GEMINI_API_KEY?: string;
-  /** Firebase web-app config for sign-in + per-account saving (see .env.example / README). */
+  /** Firebase web-app config for sign-in + per-account saving (see SETUP.md). */
   readonly VITE_FIREBASE_API_KEY?: string;
   readonly VITE_FIREBASE_AUTH_DOMAIN?: string;
   readonly VITE_FIREBASE_PROJECT_ID?: string;

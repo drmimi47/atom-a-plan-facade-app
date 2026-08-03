@@ -38,8 +38,11 @@ never ships to the client.
 ## API key
 
 `parseConstraints` reads `import.meta.env.VITE_ANTHROPIC_API_KEY`. Put it in a
-gitignored `.env.local` (see `.env.example`). ⚠️ A `VITE_`-prefixed key is
-embedded in the client bundle — fine for local/demo use, not for production.
+gitignored `.env.local` (see SETUP.md for the full variable reference). ⚠️ A
+`VITE_`-prefixed key is embedded in the client bundle — fine for local/demo use,
+not for production.
 
-Without a key, `parseConstraints` automatically uses the deterministic regex
-fallback, so the seeded `Minimum wall thickness 3"` rule still works offline.
+**No key is set today** — the project's Anthropic key has been revoked. `parseConstraints`
+falls back to the deterministic regex parser automatically, so the seeded
+`Minimum wall thickness 3"` rule still works offline, and the UI raises an
+`ApiKeyNotice` so the downgrade is visible rather than silent.
